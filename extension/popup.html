@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webGPT4CC</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <img src="icons/icon-32.png" width="20" height="20" alt="" />
+      <h1>webGPT4CC</h1>
+      <span id="connPill" class="pill">…</span>
+    </header>
+
+    <p id="statusLine" class="status" role="status" aria-live="polite">Loading…</p>
+
+    <section aria-labelledby="workersTitle">
+      <h2 id="workersTitle">Worker tabs</h2>
+      <ul id="workers" class="workers"></ul>
+      <p id="noWorkers" class="hint" hidden>No worker tab yet. Open one, or use a chatgpt.com tab you are logged in to.</p>
+      <div class="row">
+        <button id="openWorker" type="button">Open worker tab</button>
+        <button id="toggleTab" type="button" disabled>Use this tab as a worker</button>
+      </div>
+      <p id="actionError" class="error" hidden></p>
+    </section>
+
+    <section aria-labelledby="bridgeTitle">
+      <h2 id="bridgeTitle">Bridge</h2>
+      <form id="settingsForm" autocomplete="off">
+        <label for="bridgeUrl">Bridge URL</label>
+        <input id="bridgeUrl" type="url" placeholder="http://127.0.0.1:8765" spellcheck="false" required />
+        <label for="token">Pairing token</label>
+        <input id="token" type="password" spellcheck="false" placeholder="from `webgpt4cc pair`" />
+        <div class="row checks">
+          <label class="check"><input id="enabled" type="checkbox" /> Connect to the bridge</label>
+          <label class="check" title="Send raw (redacted) ChatGPT stream frames to the bridge log, to report format changes">
+            <input id="debug" type="checkbox" /> Debug log
+          </label>
+        </div>
+        <div class="row">
+          <button type="submit">Save</button>
+          <button id="reconnect" type="button" class="secondary">Reconnect</button>
+          <span id="saved" class="hint" hidden>Saved</span>
+        </div>
+      </form>
+      <p class="hint">Run <code>webgpt4cc pair</code> in a terminal to see the URL and token.</p>
+    </section>
+
+    <footer id="footer" class="hint"></footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

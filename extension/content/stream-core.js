@@ -216,6 +216,39 @@
     return t.replace(/[-]/g, '');
   }
 
+  /**
+   * Visible reasoning so far, for Claude Code's thinking block: each thought as
+   * "summary\ncontent", then commentary preambles ("Creating the file now."), in
+   * stream order, so the text normally grows as a prefix while streaming.
+   */
+  function reasoningText(messages) {
+    const parts = [];
+    for (const m of messages || []) {
+      if (!isObj(m) || !isObj(m.author) || m.author.role !== 'assistant' || !isObj(m.content)) continue;
+      const md = isObj(m.metadata) ? m.metadata : {};
+      if (md.is_visually_hidden_from_conversation === true) continue;
+      const c = m.content;
+      if (c.content_type === 'thoughts' && Array.isArray(c.thoughts)) {
+        for (const t of c.thoughts) {
+          if (!isObj(t)) continue;
+          const entry = [t.summary, t.content]
+            .filter((x) => typeof x === 'string' && x.trim())
+            .map((x) => x.trim())
+            .join('\n');
+          if (entry) parts.push(entry);
+        }
+      } else if (
+        c.content_type === 'text' &&
+        m.channel === 'commentary' &&
+        (m.recipient == null || m.recipient === '' || m.recipient === 'all')
+      ) {
+        const t = messageText(m).trim();
+        if (t) parts.push(t);
+      }
+    }
+    return sanitizeAnswerText(parts.join('\n\n'));
+  }
+
   function finishReasonOf(m) {
     const fd = m && isObj(m.metadata) && m.metadata.finish_details;
     return isObj(fd) && typeof fd.type === 'string' ? fd.type : null;
@@ -486,6 +519,7 @@
         answerStatus: answer ? answer.status || null : null,
         answerFinished,
         thinking: !text && msgs.some(isReasoningMessage),
+        reasoning: text ? '' : reasoningText(msgs),
         modelSlug: st.modelSlug,
         complete: st.complete,
         doneSeen: st.doneSeen,
@@ -833,6 +867,7 @@
     selectAnswer,
     isAnswerCandidate,
     messageText,
+    reasoningText,
     sanitizeAnswerText,
     extractWsTurnItems,
     createWsTurnTracker,

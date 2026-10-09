@@ -231,6 +231,7 @@ test('reducer: thoughts + reasoning recap + final answer; thinking flag before t
   assert.equal(s.text, '');
   assert.equal(s.thinking, true);
   assert.equal(s.modelSlug, 'gpt-5-6-thinking');
+  assert.equal(s.reasoning, 'Plan\nI should answer.');
 
   const tail = [
     [
@@ -252,9 +253,21 @@ test('reducer: thoughts + reasoning recap + final answer; thinking flag before t
     ['delta', { p: '/message/content/parts/0', o: 'append', v: 'Answer' }],
     ['delta', { v: ' text' }],
   ];
+  // a commentary preamble joins the reasoning; it grows as a prefix
+  const pre = [
+    ['delta', { p: '/message/content/thoughts', o: 'append', v: [{ summary: 'Check', content: '' }] }],
+    ['delta', { p: '/message/content/thoughts/1/content', o: 'append', v: 'Looks fine.' }],
+    ['delta', { v: { message: msg('pre1', { channel: 'commentary', metadata: { is_thinking_preamble_message: true }, content: { content_type: 'text', parts: ['Writing it now.'] } }) } }],
+  ];
+  const prefixes = [];
+  for (let i = 1; i <= pre.length; i++) prefixes.push(run(sse([...head, ...pre.slice(0, i)])).snapshot().reasoning);
+  assert.deepEqual(prefixes, ['Plan\nI should answer.\n\nCheck', 'Plan\nI should answer.\n\nCheck\nLooks fine.', 'Plan\nI should answer.\n\nCheck\nLooks fine.\n\nWriting it now.']);
+  for (let i = 1; i < prefixes.length; i++) assert.ok(prefixes[i].startsWith(prefixes[i - 1]));
+
   const st = run(sse([...head, ...tail]));
   s = st.snapshot();
   assert.equal(s.text, 'Answer text');
+  assert.equal(s.reasoning, ''); // only reported until the answer starts
   assert.equal(s.messageId, 'final1');
   assert.equal(s.thinking, false);
   assert.equal(s.answerFinished, false);

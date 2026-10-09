@@ -1,5 +1,5 @@
 {
   "private": true,
-  "description": "Lets `node --test extension/test/` work on Node 22, which does not expand directories: the directory resolves to this entry file.",
-  "main": "stream-core.test.mjs"
+  "description": "Makes `node --test extension/test/` work on Node 22 (a directory argument resolves to this entry file).",
+  "main": "run-all.mjs"
 }

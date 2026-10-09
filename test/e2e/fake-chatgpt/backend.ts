@@ -1,19 +1,24 @@
 // Fake chatgpt.com for end-to-end tests: serves the fake front end (index.html +
-// app.js) and its backend through Playwright routing, so nothing listens on a
-// port and all state lives in this Node process.
+// app.js) and its backend through Playwright routing. All state lives in this
+// Node process.
 //
 //   context.route('https://chatgpt.com/**')      -> pages, /api/auth/session, /backend-api/*
 //   context.routeWebSocket('wss://ws.chatgpt.com/**') -> the stream_handoff topic socket
 //
-// Limitation: Playwright's route.fulfill() delivers a response body in one
-// piece, so SSE frames reach the page together (the page still reads them via
-// response.body.getReader(), which is what the extension observes). The
-// WebSocket handoff mode delivers its frames one by one with real delays.
+// SSE delivery: Playwright's route.fulfill() can only hand over a body in one
+// piece, so by default (`sseDelivery: 'stream'`) the conversation POST is
+// continued to a loopback HTTPS server (stream-server.ts) that writes the body in
+// small byte slices over time, like the real site, and can drop the connection
+// midway (FakeReply.cutAfterEvents). The page still sees https://chatgpt.com/…
+// Contexts must be created with `ignoreHTTPSErrors: true` (see
+// FAKE_CONTEXT_OPTIONS). Without openssl the fake falls back to whole bodies.
+// The WebSocket handoff mode delivers its frames one by one with real delays.
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrowserContext, Page, Route, WebSocketRoute } from 'playwright';
 import { buildTurnStream, formatSse, type SseEvent, type StoredMessage } from './stream.ts';
+import { SseStreamServer } from './stream-server.ts';
 
 const HERE = import.meta.dirname;
 
@@ -32,6 +37,13 @@ export interface FakeReply {
   delayMs?: number;
   /** Answer the POST with this status and JSON body instead of a stream. */
   httpError?: { status: number; body: unknown };
+  /**
+   * Drop the HTTP connection in the middle of the SSE event that follows the
+   * first `cutAfterEvents` events (a broken stream: the page's read() rejects;
+   * with whole-body delivery the body just ends there). The turn is still stored
+   * complete, so GET /backend-api/conversation/{id} returns the full answer.
+   */
+  cutAfterEvents?: number;
 }
 
 export interface LlmContext {
@@ -72,7 +84,14 @@ export interface FakeOptions {
   wsCatchups: number;
   /** Print every handled request (or pass a function). */
   log: boolean | ((line: string) => void);
+  /** 'stream': SSE bodies arrive in slices over time (needs openssl); 'whole': route.fulfill in one piece. */
+  sseDelivery: 'stream' | 'whole';
+  /** Pause between SSE slices in 'stream' delivery. */
+  sseSliceDelayMs: number;
 }
+
+/** Browser context options the fake needs (the loopback stream server's certificate is self-signed). */
+export const FAKE_CONTEXT_OPTIONS = { ignoreHTTPSErrors: true } as const;
 
 export interface RecordedRequest {
   index: number;
@@ -96,6 +115,18 @@ export interface RecordedRequest {
   reply?: string;
   /** For continuations: whether parent_message_id was the conversation's current node. */
   parentIsCurrentNode?: boolean;
+  /** Exact HTTP response body sent (SSE text, or the JSON error). */
+  responseBody?: string;
+  /** SSE text of each WebSocket stream item (handoff mode), in order, without duplicates. */
+  wsItems?: string[];
+  /** How the HTTP body was delivered. */
+  delivery?: 'stream' | 'whole';
+  /** 'stream' delivery: number of slices written (set when the response ended). */
+  slices?: number;
+  /** The connection was dropped on purpose (FakeReply.cutAfterEvents). */
+  cut?: boolean;
+  /** 'stream' delivery: the page stopped reading before the body ended (normal after message_stream_complete). */
+  readerAborted?: boolean;
 }
 
 export interface FakeConversation {
@@ -132,6 +163,7 @@ export class FakeChatGPT {
   readonly accessToken = `fake-access-token-${randomUUID()}`;
   private readonly topics = new Map<string, PendingTopic>();
   private seq = 0;
+  private streamServer: SseStreamServer | null = null;
 
   constructor(options: Partial<FakeOptions> = {}) {
     this.options = {
@@ -148,14 +180,40 @@ export class FakeChatGPT {
       wsFrameDelayMs: 25,
       wsCatchups: 3,
       log: false,
+      sseDelivery: 'stream',
+      sseSliceDelayMs: 4,
       ...options,
     };
   }
 
-  /** Route chatgpt.com (HTTP) and ws.chatgpt.com (WebSocket) for a context or page. */
+  /**
+   * Route chatgpt.com (HTTP) and ws.chatgpt.com (WebSocket) for a context or page.
+   * The context must have been created with FAKE_CONTEXT_OPTIONS.
+   */
   async install(target: BrowserContext | Page): Promise<void> {
+    if (this.options.sseDelivery === 'stream' && !this.streamServer) {
+      this.streamServer = await SseStreamServer.start();
+      if (this.streamServer) {
+        const context = 'context' in target && typeof target.context === 'function' ? target.context() : (target as BrowserContext);
+        try {
+          await context.grantPermissions(['local-network-access'], { origin: 'https://chatgpt.com' });
+        } catch (e) {
+          // Without the grant the loopback request would wait for a permission prompt forever.
+          this.log(`cannot grant local-network-access (${(e as Error).message}); SSE bodies are delivered whole`);
+          await this.streamServer.close();
+          this.streamServer = null;
+        }
+      } else this.log('openssl is not available; SSE bodies are delivered whole');
+    }
     await target.route(/^https:\/\/chatgpt\.com\//, (route) => this.handle(route));
     await target.routeWebSocket(/^wss:\/\/ws\.chatgpt\.com\//, (ws) => this.handleWebSocket(ws));
+  }
+
+  /** Stop the loopback stream server (call after closing the browser context). */
+  async close(): Promise<void> {
+    const s = this.streamServer;
+    this.streamServer = null;
+    await s?.close();
   }
 
   /** Wait until at least `n` conversation requests were received. */
@@ -326,6 +384,13 @@ export class FakeChatGPT {
     };
   }
 
+  /** Answer a conversation POST with JSON and keep the body on the record. */
+  private jsonFor(rec: RecordedRequest, route: Route, status: number, body: unknown): Promise<number> {
+    rec.status = status;
+    rec.responseBody = JSON.stringify(body);
+    return this.json(route, status, body);
+  }
+
   private async conversationPost(route: Route, raw: string): Promise<number> {
     let body: Record<string, unknown>;
     try {
@@ -355,8 +420,7 @@ export class FakeChatGPT {
 
     if (this.options.rateLimit) {
       const clears = this.options.rateLimit.clearsInSec ?? 3600;
-      rec.status = 429;
-      return this.json(route, 429, {
+      return this.jsonFor(rec, route, 429, {
         detail: {
           message: this.options.rateLimit.message ?? "You've reached our limit of messages per hour. Please try again later.",
           code: 'rate_limit_exceeded',
@@ -369,10 +433,7 @@ export class FakeChatGPT {
     let conv: FakeConversation | undefined;
     if (rec.conversationId) {
       conv = this.conversations.get(rec.conversationId);
-      if (!conv) {
-        rec.status = 404;
-        return this.json(route, 404, { detail: { code: 'conversation_not_found', message: 'Conversation not found' } });
-      }
+      if (!conv) return this.jsonFor(rec, route, 404, { detail: { code: 'conversation_not_found', message: 'Conversation not found' } });
       rec.parentIsCurrentNode = rec.parentMessageId === conv.currentNode;
     }
     const isNew = !conv;
@@ -390,13 +451,20 @@ export class FakeChatGPT {
     }
 
     const ctx: LlmContext = { conversationId: conv.id, turn: conv.turns.length, history: conv.turns.map((t) => ({ ...t })), temporary, model: rec.model, request: rec };
-    const out = await this.options.llm(prompt, ctx);
+    let out: string | FakeReply;
+    try {
+      out = await this.options.llm(prompt, ctx);
+    } catch (e) {
+      // A bug in the test's scripted LLM: answer like a backend failure and keep the evidence.
+      if (isNew) this.conversations.delete(conv.id);
+      this.log(`scripted LLM threw: ${(e as Error).stack ?? e}`);
+      return this.jsonFor(rec, route, 500, { detail: `fake LLM error: ${(e as Error).message}` });
+    }
     const reply: FakeReply = typeof out === 'string' ? { text: out } : out;
     if (reply.delayMs) await new Promise((r) => setTimeout(r, reply.delayMs));
     if (reply.httpError) {
-      rec.status = reply.httpError.status;
       if (isNew) this.conversations.delete(conv.id);
-      return this.json(route, reply.httpError.status, reply.httpError.body);
+      return this.jsonFor(rec, route, reply.httpError.status, reply.httpError.body);
     }
 
     const work = rec.composerMode === 'work';
@@ -451,18 +519,48 @@ export class FakeChatGPT {
       status: 200,
     });
 
+    rec.responseBody = formatSse(stream.http);
+    let cutAtByte: number | undefined;
+    if (reply.cutAfterEvents !== undefined) {
+      // Cut halfway through the next event, so the page is left with a partial line.
+      const n = Math.max(0, Math.min(reply.cutAfterEvents, stream.http.length - 1));
+      cutAtByte = Buffer.byteLength(formatSse(stream.http.slice(0, n))) + Math.floor(Buffer.byteLength(formatSse([stream.http[n]!])) / 2);
+      rec.cut = true;
+      rec.responseBody = Buffer.from(rec.responseBody, 'utf8').subarray(0, cutAtByte).toString('utf8');
+    }
     if (transport === 'ws') {
+      rec.wsItems = stream.ws.map((e) => formatSse([e]));
       this.topics.set(topicId, {
         topicId,
         delivered: false,
         items: stream.ws.map((e, i) => ({ id: `${turnExchangeId}:${i}`, encoded: formatSse([e]) })),
       });
     }
+    if (this.streamServer) {
+      rec.delivery = 'stream';
+      const url = this.streamServer.register(
+        {
+          body: formatSse(stream.http),
+          cutAtByte,
+          sliceDelayMs: this.options.sseSliceDelayMs,
+          seed: rec.index * 31 + 7,
+          onEnd: (info) => {
+            rec.slices = info.slices;
+            rec.readerAborted = info.aborted;
+          },
+        },
+        new URL(route.request().url()).pathname,
+      );
+      await route.continue({ url }).catch(() => {});
+      return 200;
+    }
+    rec.delivery = 'whole';
     await route
       .fulfill({
         status: 200,
         headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', 'x-oai-request-id': this.newId() },
-        body: formatSse(stream.http),
+        // A cut body simply ends early here (EOF before message_stream_complete).
+        body: cutAtByte !== undefined ? Buffer.from(formatSse(stream.http), 'utf8').subarray(0, cutAtByte) : rec.responseBody,
       })
       .catch(() => {});
     return 200;

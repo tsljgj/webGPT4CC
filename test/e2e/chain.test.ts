@@ -5,7 +5,7 @@
 // Scenarios share one browser, bridge and worker tab and run in order; the 429
 // scenario must stay last because the bridge then fails fast for `clears_in`.
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, it, type TestContext } from 'node:test';
 import type { ChatEvent } from '../../bridge/src/providers/types.ts';
@@ -34,13 +34,23 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
   let chain: Chain;
   // The fake's scripted LLM delegates to this, so each scenario can script its own replies.
   let llm: FakeLlm = () => 'OK';
-  const bridgeOnly = (p: string) => !p.includes('# Bridge instructions') && !p.includes('<tool_result');
+  // Claude Code helper requests (titles, summaries...) that the bridge may forward as one-off temporary chats.
+  const isHelperPrompt = (p: string) => !p.includes('# Bridge instructions') && !p.includes('<tool_result');
+
+  // Scratch working directories for the claude runs (removed at the end).
+  const workDirs: string[] = [];
+  const workDir = () => {
+    const d = tempDir('work');
+    workDirs.push(d);
+    return d;
+  };
 
   before(async () => {
     chain = await startChain({ fake: { llm: (prompt, ctx) => llm(prompt, ctx) } });
   });
   after(async () => {
     await chain?.close();
+    for (const d of workDirs) rmSync(d, { recursive: true, force: true });
   });
 
   /** Run a scenario; on failure print every component's logs. */
@@ -70,7 +80,7 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
 
   it('scenario 1: Write tool round trip over SSE, continued in the same ChatGPT conversation', { timeout: 300_000 }, (t) =>
     scenario(t, async () => {
-      const work = tempDir('work');
+      const work = workDir();
       const target = join(work, 'hello.txt');
       // Characters that rendered DOM text would lose or mangle: markdown, indentation, tabs, HTML-ish text, a surrogate pair.
       const content = 'Hello from **webGPT4CC**\n  indented line\twith a tab\n\n<not-a-tag> & "quotes" 😀 中文\n';
@@ -91,7 +101,7 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
       assert.equal(readFileSync(target, 'utf8'), content);
 
       // Two ChatGPT turns in ONE conversation: the second is a continuation carrying the tool result.
-      const main = requests.filter((r) => !bridgeOnly(r.prompt));
+      const main = requests.filter((r) => !isHelperPrompt(r.prompt));
       assert.equal(main.length, 2, `expected 2 ChatGPT turns, got ${requests.length}: ${JSON.stringify(requests.map((r) => r.prompt.slice(0, 60)))}`);
       const [r1, r2] = main as [RecordedRequest, RecordedRequest];
       assert.equal(r1.conversationId, undefined, 'first turn starts a new chat');
@@ -131,7 +141,7 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
 
   it('scenario 2: reply delivered over the stream_handoff WebSocket', { timeout: 300_000 }, (t) =>
     scenario(t, async () => {
-      const work = tempDir('work');
+      const work = workDir();
       const intro = 'Running the command now. '.repeat(30).trim();
       const firstReply = `${intro}\n<tool_call name="Bash">\n<param name="command">printf 'ws-%s\\n' ok > ws.txt</param>\n<param name="description">Write ws.txt</param>\n</tool_call>`;
       llm = (prompt) => {
@@ -149,7 +159,7 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
         assert.equal(run.json?.result, 'Handoff done.', summary(run));
         assert.equal(readFileSync(join(work, 'ws.txt'), 'utf8'), 'ws-ok\n');
 
-        const main = requests.filter((r) => !bridgeOnly(r.prompt));
+        const main = requests.filter((r) => !isHelperPrompt(r.prompt));
         assert.equal(main.length, 2);
         assert.ok(main.every((r) => r.transport === 'ws'));
         assert.equal(main[0]!.conversationId, undefined, 'a new claude session starts a new chat');
@@ -175,7 +185,7 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
 
   it('scenario 3: ChatGPT HTTP 429 becomes a quick, non-retried claude error (keep last)', { timeout: 180_000 }, (t) =>
     scenario(t, async () => {
-      const work = tempDir('work');
+      const work = workDir();
       llm = () => 'should not be called';
       chain.fake.options.rateLimit = { clearsInSec: 3600 };
       try {

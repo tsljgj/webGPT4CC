@@ -15,8 +15,8 @@
 //    WebSocket mock is injected before the extension's MAIN-world document_start
 //    script, so the extension's WebSocket wrapper sees the routed socket.
 //  * The extension is configured and given a worker tab from its service
-//    worker (chrome.storage.local {bridgeUrl, token}; the tab id is added the way
-//    the popup's "Use this tab" does, or through a test hook when present).
+//    worker: chrome.storage.local {bridgeUrl, token} (what the popup saves), then
+//    globalThis.webgpt4cc.addWorker(tabId) (what the popup's "Use this tab" calls).
 //
 // Environment knobs: E2E_VERBOSE=1 (stream bridge/browser/fake logs to stderr),
 // E2E_HEADED=1, E2E_EXTENSION_DIR=/path/to/unpacked/extension, CLAUDE_BIN=/path/to/claude.
@@ -32,7 +32,7 @@ import { ExtensionProvider } from '../../bridge/src/providers/extension.ts';
 import type { ChatEvent, ChatJob, WorkerInfo } from '../../bridge/src/providers/types.ts';
 import { createBridgeServer, type BridgeServer } from '../../bridge/src/server.ts';
 import { VERSION } from '../../bridge/src/version.ts';
-import { FakeChatGPT, type FakeOptions } from './fake-chatgpt/backend.ts';
+import { FAKE_CONTEXT_OPTIONS, FakeChatGPT, type FakeOptions } from './fake-chatgpt/backend.ts';
 
 // `chrome` only exists inside the extension's service worker (sw.evaluate callbacks).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -43,6 +43,16 @@ export const ROOT = resolve(import.meta.dirname, '../..');
 export const EXTENSION_DIR = process.env.E2E_EXTENSION_DIR ? resolve(process.env.E2E_EXTENSION_DIR) : join(ROOT, 'extension');
 export const VERBOSE = process.env.E2E_VERBOSE === '1';
 export const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+
+/**
+ * Chromium flags that keep the browser off the internet: everything except
+ * loopback (the bridge) goes to a dead local proxy, so traffic that escapes
+ * Playwright routing (Chromium preconnects to the navigated origin, component
+ * updates, or an extension request the routes do not cover) fails instead of
+ * reaching the real chatgpt.com. Routed requests never touch the network.
+ * (Not Playwright's `proxy` option: it forces loopback through the proxy too.)
+ */
+export const HERMETIC_ARGS = ['--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<local>;127.0.0.1;localhost;[::1]'];
 
 export const AUTH_TOKEN = 'e2e-auth-token';
 export const EXTENSION_TOKEN = 'e2e-extension-token';
@@ -70,6 +80,21 @@ export function extensionAvailable(): boolean {
   return existsSync(join(EXTENSION_DIR, 'manifest.json'));
 }
 
+/**
+ * Reason to skip browser tests because Playwright's Chromium is not installed
+ * (PLAYWRIGHT_BROWSERS_PATH; this repo never runs `playwright install` itself), or false.
+ * `channel: 'chromium'` (the extension tests) runs this executable.
+ */
+export function chromiumSkipReason(): string | false {
+  let path = '';
+  try {
+    path = chromium.executablePath();
+  } catch (e) {
+    return `Playwright cannot locate Chromium (${(e as Error).message.split('\n')[0]})`;
+  }
+  return existsSync(path) ? false : `Playwright's Chromium is not installed (${path} is missing; set PLAYWRIGHT_BROWSERS_PATH)`;
+}
+
 export function claudeAvailable(): boolean {
   const r = spawnSync(CLAUDE_BIN, ['--version'], { encoding: 'utf8', timeout: 20_000 });
   return r.status === 0;
@@ -78,6 +103,8 @@ export function claudeAvailable(): boolean {
 /** Reason to skip the full-chain tests, or false. */
 export function chainSkipReason(): string | false {
   if (!extensionAvailable()) return `no ${join(EXTENSION_DIR, 'manifest.json')} yet (the extension is not built)`;
+  const noBrowser = chromiumSkipReason();
+  if (noBrowser) return noBrowser;
   if (!claudeAvailable()) return `the claude CLI (${CLAUDE_BIN}) is not available`;
   return false;
 }
@@ -177,7 +204,7 @@ export async function launchChromium(opts: { extensionDir?: string; headless?: b
   const headless = opts.headless ?? process.env.E2E_HEADED !== '1';
   if (!headless && !process.env.DISPLAY) throw new Error('E2E_HEADED=1 needs an X display; run the tests under `xvfb-run -a`');
   const userDataDir = tempDir('profile');
-  const args = ['--no-first-run', '--no-default-browser-check', '--disable-features=Translate'];
+  const args = ['--no-first-run', '--no-default-browser-check', '--disable-features=Translate', ...HERMETIC_ARGS];
   if (opts.extensionDir) args.push(`--disable-extensions-except=${opts.extensionDir}`, `--load-extension=${opts.extensionDir}`);
   const context = await chromium.launchPersistentContext(userDataDir, {
     // 'chromium' = full Chromium in new headless mode (extensions work); the default
@@ -186,6 +213,8 @@ export async function launchChromium(opts: { extensionDir?: string; headless?: b
     headless,
     args,
     viewport: { width: 1280, height: 900 },
+    // The fake's loopback SSE stream server uses a self-signed certificate.
+    ...FAKE_CONTEXT_OPTIONS,
   });
   const logs = new LogBuffer('browser');
   const watchPage = (page: Page) => {
@@ -222,10 +251,11 @@ export async function configureExtension(sw: Worker, settings: { bridgeUrl: stri
 }
 
 /**
- * Make `page`'s tab a worker. Uses a test hook on the service worker when the
- * extension exposes one (`webgpt4cc.addWorkerTab(tabId)` or similar), otherwise
- * the storage contract from docs/EXTENSION.md (chrome.storage.session
- * workerTabIds), which the service worker is expected to watch.
+ * Make `page`'s tab a worker, exactly as the popup's "Use this tab" does: the
+ * service worker exposes `globalThis.webgpt4cc.addWorker(tabId)` for automation
+ * (extension/background.js). If a build lacks that hook, fall back to writing
+ * chrome.storage.session.workerTabIds (only effective if the service worker
+ * re-reads it, e.g. after a restart).
  */
 export async function registerWorkerTab(sw: Worker, page: Page): Promise<{ tabId: number; via: string }> {
   const tabId = await waitFor(
@@ -239,15 +269,10 @@ export async function registerWorkerTab(sw: Worker, page: Page): Promise<{ tabId
     10_000,
   );
   const via = await sw.evaluate(async (id) => {
-    const g = globalThis as Record<string, unknown>;
-    for (const name of ['webgpt4cc', '__webgpt4cc', '__webgpt4ccTest', 'webgpt4ccTest']) {
-      const api = g[name] as Record<string, unknown> | undefined;
-      for (const fn of ['addWorkerTab', 'useTab', 'addWorker']) {
-        if (api && typeof api[fn] === 'function') {
-          await (api[fn] as (id: number) => unknown)(id);
-          return `${name}.${fn}`;
-        }
-      }
+    const api = (globalThis as Record<string, unknown>).webgpt4cc as { addWorker?: (id: number) => Promise<unknown> } | undefined;
+    if (api && typeof api.addWorker === 'function') {
+      await api.addWorker(id);
+      return 'webgpt4cc.addWorker';
     }
     const { workerTabIds = [] } = (await chrome.storage.session.get('workerTabIds')) as { workerTabIds?: number[] };
     if (!workerTabIds.includes(id)) await chrome.storage.session.set({ workerTabIds: [...workerTabIds, id] });
@@ -331,7 +356,8 @@ export interface Chain {
 export async function startChain(opts: { fake?: Partial<FakeOptions>; bridge?: Partial<BridgeConfig>; extensionDir?: string } = {}): Promise<Chain> {
   const fakeLogs = new LogBuffer('fake');
   const fake = new FakeChatGPT({ log: (l) => fakeLogs.push(l), ...opts.fake });
-  const cleanups: Array<() => Promise<void>> = [];
+  // Cleanups run in reverse order: the browser first, the fake's stream server last.
+  const cleanups: Array<() => Promise<void>> = [() => fake.close()];
   const closeAll = async () => {
     for (const fn of cleanups.reverse()) await fn().catch(() => {});
     cleanups.length = 0;

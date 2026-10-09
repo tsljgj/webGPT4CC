@@ -4,8 +4,9 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
-import { FakeChatGPT, type FakeOptions, parseSseEvents } from './fake-chatgpt/backend.ts';
+import { FAKE_CONTEXT_OPTIONS, FakeChatGPT, type FakeOptions, parseSseEvents } from './fake-chatgpt/backend.ts';
 import { DeltaReducer, reduceSse } from './fake-chatgpt/delta.ts';
+import { chromiumSkipReason, HERMETIC_ARGS } from './harness.ts';
 
 const COMPOSER = 'form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]';
 const SEND = 'form button[aria-label="Send prompt"]';
@@ -15,19 +16,23 @@ const ANSWER = '[data-content-search-unit-key$=":assistant"] [data-markdown-text
 
 let browser: Browser;
 const contexts: BrowserContext[] = [];
+const fakes: FakeChatGPT[] = [];
+const skip = chromiumSkipReason();
 
-before(async () => {
-  // No extension here, so the default headless shell is fine.
-  browser = await chromium.launch();
-});
-after(async () => {
+async function launchBrowser(): Promise<void> {
+  // The same full Chromium build the extension tests use (and that chromiumSkipReason checks).
+  browser = await chromium.launch({ channel: 'chromium', args: HERMETIC_ARGS });
+}
+async function closeAll(): Promise<void> {
   for (const c of contexts) await c.close().catch(() => {});
   await browser?.close();
-});
+  for (const f of fakes) await f.close();
+}
 
 async function openFake(opts: Partial<FakeOptions> = {}, url = 'https://chatgpt.com/', initScript?: () => void): Promise<{ fake: FakeChatGPT; page: Page; context: BrowserContext }> {
   const fake = new FakeChatGPT({ hydrationDelayMs: 50, ...opts });
-  const context = await browser.newContext();
+  fakes.push(fake);
+  const context = await browser.newContext(FAKE_CONTEXT_OPTIONS);
   contexts.push(context);
   await fake.install(context);
   if (initScript) await context.addInitScript(initScript);
@@ -107,7 +112,10 @@ const TRICKY = [
   ' nbsp',
 ].join('\n');
 
-describe('fake chatgpt.com', () => {
+describe('fake chatgpt.com', { skip }, () => {
+  before(launchBrowser);
+  after(closeAll);
+
   it('renders the 2026-09 composer, a disabled send button and the Chat/Work switch', async () => {
     const { page } = await openFake();
     const ed = page.locator(COMPOSER);
@@ -133,13 +141,14 @@ describe('fake chatgpt.com', () => {
     await waitIdle(page);
 
     const [req] = await fake.waitForRequests(1);
+    // (The page aborts the read after message_stream_complete, so take the body from the fake's record.)
     assert.equal(req!.prompt, text);
     assert.equal(req!.conversationId, undefined);
     assert.equal(req!.parentMessageId, 'client-created-root');
     assert.equal(req!.status, 200);
     // The SSE body decodes to the scripted reply.
     assert.match(resp.headers()['content-type'] ?? '', /text\/event-stream/);
-    const body = await resp.text();
+    const body = req!.responseBody!;
     const events = parseSseEvents(body);
     assert.deepEqual(events[0], { event: 'delta_encoding', data: '"v1"' });
     assert.equal(events.at(-1)!.data, '[DONE]');
@@ -209,10 +218,9 @@ describe('fake chatgpt.com', () => {
   it('streams reasoning and a commentary preamble that are not part of the answer', async () => {
     const { fake, page } = await openFake({ llm: () => ({ text: 'The answer.', thoughts: ['Reading', 'Planning'], preamble: 'Let me check that first.' }) });
     await paste(page, 'think');
-    const respP = page.waitForResponse((r) => new URL(r.url()).pathname === '/backend-api/f/conversation');
     await send(page);
-    const body = await (await respP).text();
     await waitIdle(page);
+    const body = (await fake.waitForRequests(1))[0]!.responseBody!;
     assert.match(body, /"content_type":"thoughts"/);
     assert.match(body, /"content_type":"reasoning_recap"/);
     assert.match(body, /"is_thinking_preamble_message":true/);
@@ -290,10 +298,9 @@ describe('fake chatgpt.com', () => {
       });
     });
     await paste(page, 'go');
-    const respP = page.waitForResponse((r) => new URL(r.url()).pathname === '/backend-api/f/conversation');
     await send(page);
-    const httpBody = await (await respP).text();
     await waitIdle(page);
+    const httpBody = fake.requests[0]!.responseBody!;
     // HTTP part: handoff and [DONE], but no answer and no message_stream_complete.
     const http = reduceSse(httpBody);
     assert.ok(http.handoffTopic?.startsWith('conversation-turn-'));
