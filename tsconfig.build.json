@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "allowImportingTsExtensions": true,
+    "outDir": "dist",
+    "rootDir": "bridge/src",
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["bridge/src/**/*.ts"]
+}

@@ -1,0 +1,44 @@
+{
+  "name": "webgpt4cc",
+  "version": "0.1.0",
+  "description": "Run the Claude Code harness on your ChatGPT web (chatgpt.com) subscription via a local Anthropic-compatible bridge and a browser extension.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tsljgj/webGPT4CC.git"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "bin": {
+    "webgpt4cc": "bin/webgpt4cc.mjs",
+    "gptcc": "bin/gptcc.mjs"
+  },
+  "files": [
+    "bin/",
+    "bridge/src/",
+    "dist/",
+    "extension/",
+    "plugin/",
+    "docs/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bridge/src/cli.ts serve",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --test-reporter=spec \"bridge/test/**/*.test.ts\" \"plugin/test/**/*.test.mjs\"",
+    "test:e2e": "node --test --test-reporter=spec --test-concurrency=1 \"test/e2e/**/*.test.ts\""
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.0",
+    "typescript": "^5.9.0"
+  }
+}
