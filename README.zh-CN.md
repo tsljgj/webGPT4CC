@@ -172,6 +172,8 @@ npm run test:e2e    # Playwright + 扩展 + 假 chatgpt.com + 真实 claude CLI�
 webgpt4cc serve --provider mock --mock-script replies.json   # 不连 ChatGPT 调试 bridge
 ```
 
+接手开发请先读 [docs/HANDOFF.md](docs/HANDOFF.md)：当前状态、设计决策、已验证的事实和待办。
+
 ## 免责声明
 
 这是非官方的社区项目，与 OpenAI、Anthropic 没有任何关联，也没有得到它们的认可或支持。

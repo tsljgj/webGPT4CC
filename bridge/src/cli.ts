@@ -9,7 +9,7 @@ import { type BridgeConfig, configPath, loadConfig, readRuntime, runtimePath, wr
 import { bridgeUrl, childEnv, claudeArgs, claudeEnv, formatEnv, withBareAuth } from './launch.ts';
 import { createLogger } from './log.ts';
 import { MockProvider } from './providers/mock.ts';
-import { createBridgeServer, createProvider } from './server.ts';
+import { createBridgeServer, createProvider, isLoopback } from './server.ts';
 import { VERSION } from './version.ts';
 
 const HELP = `webgpt4cc ${VERSION} — run Claude Code on your ChatGPT web subscription
@@ -92,6 +92,16 @@ async function serve(flags: Record<string, string | boolean>): Promise<void> {
     /* best effort */
   }
   log.info(`webGPT4CC bridge ${VERSION} listening on ${url} (provider: ${provider.name})`);
+  if (!isLoopback(host)) {
+    log.warn(
+      `listening on ${host}, not loopback: prompts (your code), replies and the tool calls Claude Code runs travel unencrypted over the network` +
+        (config.authToken ? '' : '; authToken is empty, so anyone who can reach this port can spend your ChatGPT quota') +
+        (config.provider === 'extension' && !config.extensionToken
+          ? '; extensionToken is empty, so anyone who can reach this port can pose as the extension and answer Claude Code with tool calls'
+          : '') +
+        '. Prefer 127.0.0.1 and an SSH tunnel; the extension refuses a plain ws:// bridge on another computer unless its popup allows it.',
+    );
+  }
   if (config.provider === 'extension') {
     // Printed directly (not through the logger) so the token never lands in a --dump-dir log file.
     process.stderr.write(`extension pairing: bridge URL ${url}  token ${config.extensionToken || '(none)'}\n`);

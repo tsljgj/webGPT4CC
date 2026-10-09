@@ -76,7 +76,10 @@
   Claude Code.
 * Tokens live in `~/.webgpt4cc/config.json` (mode 0600).
 * Prompts contain your code. They go to ChatGPT, exactly as if you pasted them.
-* The page agent never reads or logs cookies, access tokens or resume tokens.
+* The page agent never logs or stores cookies, access tokens or resume tokens, and never
+  sends them to the bridge. Only when a stream breaks does it read the session's access token
+  (and, for workspace accounts, the `_account` cookie), in memory, to read the reply back
+  with the same `GET /backend-api/conversation/<id>` the page itself makes.
 
 ## Known limitations (v0.1)
 

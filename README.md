@@ -191,6 +191,9 @@ npm run test:e2e    # Playwright + extension + fake chatgpt.com + real claude CL
 webgpt4cc serve --provider mock --mock-script replies.json   # bridge without ChatGPT
 ```
 
+Picking up the project? Start with [docs/HANDOFF.md](docs/HANDOFF.md) (in Chinese): current state,
+design decisions, verified facts and open work.
+
 ## Disclaimer
 
 This is an unofficial community project. It is not affiliated with, endorsed by, or
