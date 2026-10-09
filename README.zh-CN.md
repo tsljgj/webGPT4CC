@@ -94,9 +94,9 @@ gptcc -p "给 src/api.ts 加上输入校验，并跑一下测试" --allowedTools
   适合上下文窗口较小的套餐。
 * **其他客户端：** 执行 `eval "$(webgpt4cc env)"`（PowerShell 用 `webgpt4cc env --shell powershell`），
   然后运行 `claude --permission-mode default`（不要用 `auto`）。
-* `gptcc`、`webgpt4cc env`、`pair`、`doctor` 和插件都通过 `~/.webgpt4cc/config.json` 找到 bridge。
-  如果 bridge 用了别的端口，请在配置文件里设置 `port`（或者对所有命令设置 `WEBGPT4CC_PORT`），
-  不要只用 `serve --port`。
+* `gptcc`、`webgpt4cc env`、`pair`、`doctor` 和插件会先通过 `~/.webgpt4cc/runtime.json`
+  （由 `serve` 写入，包含 `--port`/`--host`）找到正在运行的 bridge，其次读取 `~/.webgpt4cc/config.json`。
+  环境变量 `WEBGPT4CC_PORT` / `WEBGPT4CC_HOST` 优先级最高。
 
 **在普通 Claude Code 里委派任务（插件）：**
 

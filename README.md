@@ -104,9 +104,9 @@ gptcc -p "add input validation to src/api.ts and run the tests" --allowedTools "
   about 45 KB to about 20 KB, which helps on plans with small context windows.
 * **Other clients:** run `eval "$(webgpt4cc env)"` (or `webgpt4cc env --shell powershell`), then
   `claude --permission-mode default` (never `auto`).
-* `gptcc`, `webgpt4cc env`, `pair`, `doctor` and the plugin find the bridge through
-  `~/.webgpt4cc/config.json`. If you run the bridge on another port, set `port` there (or
-  `WEBGPT4CC_PORT` for every command), not only `serve --port`.
+* `gptcc`, `webgpt4cc env`, `pair`, `doctor` and the plugin find a running bridge through
+  `~/.webgpt4cc/runtime.json` (written by `serve`, including its `--port`/`--host`), then
+  `~/.webgpt4cc/config.json`. `WEBGPT4CC_PORT` / `WEBGPT4CC_HOST` override both.
 
 **Delegate from your normal Claude Code (plugin):**
 
