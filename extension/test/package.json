@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "description": "Lets `node --test extension/test/` work on Node 22, which does not expand directories: the directory resolves to this entry file.",
+  "main": "stream-core.test.mjs"
+}
