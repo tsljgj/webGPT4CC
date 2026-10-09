@@ -83,7 +83,10 @@ gptcc                      # 交互模式
 gptcc -p "给 src/api.ts 加上输入校验，并跑一下测试"
 ```
 
-`gptcc` 就是带上 bridge 环境变量的 `claude`，`claude` 的所有参数都能用。它默认使用
+`gptcc` 就是带上 bridge 环境变量的 `claude`，`claude` 的所有参数都能用。
+加上 `--lite` 后，Claude Code 只保留核心工具（Bash、Read、Edit、Write、WebFetch、WebSearch、
+NotebookEdit、AskUserQuestion，不启用子 agent）。第一条 ChatGPT 消息会从约 45 KB 缩小到约 20 KB，
+适合上下文窗口较小的套餐。它默认使用
 `default` 权限模式，因为 Claude Code 的 `auto` 模式每次调用工具都要额外发两个很大的模型请求
 （安全分类器），走 ChatGPT 不现实。如果想用别的客户端，执行 `eval "$(webgpt4cc env)"`
 （PowerShell 用 `webgpt4cc env --shell powershell`）之后再运行 `claude`。
@@ -97,7 +100,8 @@ gptcc -p "给 src/api.ts 加上输入校验，并跑一下测试"
 
 然后直接对 Claude 说“把这个交给 GPT 做”，或者使用 `/gpt-web:delegate <任务>`、
 `/gpt-web:ask <问题>`、`/gpt-web:status`。被委派的 agent 默认只有读、搜索和编辑工具；
-Claude 可以按任务授予 `Bash(...)` 规则。
+Claude 可以按任务授予 `Bash(...)` 规则，也可以传 `lite: true` 得到更轻量的 delegate。
+被委派的 agent 不能再继续委派。
 
 **在你自己的代码里（Claude Agent SDK）：** 见 [examples/agent-sdk.ts](examples/agent-sdk.ts)。
 
@@ -116,10 +120,11 @@ Claude 可以按任务授予 `Bash(...)` 规则。
 | `newChatUrl` | `https://chatgpt.com/?model={model}` | 新对话的 URL。可以填某个 ChatGPT 项目（Project）的地址，把 bridge 的对话集中放在一起 |
 | `temporaryChats` | `false` | 新对话用“临时聊天”（不进历史记录，不用记忆） |
 | `conversationMode` | `continue` | 设为 `stateless` 时，每个请求都开一个新对话 |
-| `maxConversationTokens` | `150000` | ChatGPT 对话超过这个大小时，开新对话并重放记录 |
-| `claudeContextWindow` | `128000` | Claude Code 做自动压缩时参照的上下文窗口（`CLAUDE_CODE_MAX_CONTEXT_TOKENS`） |
+| `maxConversationTokens` | `110000` | ChatGPT 对话超过这个大小时，开新对话并重放记录 |
+| `claudeContextWindow` | `120000` | Claude Code 做自动压缩时参照的上下文窗口（`CLAUDE_CODE_MAX_CONTEXT_TOKENS`） |
 | `jobTimeoutMs` | `1200000` | 单次 ChatGPT 回复的最长等待时间 |
 | `webSearch` | `chatgpt` | Claude Code 的 WebSearch 工具交给 ChatGPT 自带的联网搜索；`disabled` 表示拒绝 |
+| `webFetchSummaries` | `local` | WebFetch 本来会让小模型总结每个网页。`local` 直接返回网页内容（截断到 2 万字符），每次抓取省一条 ChatGPT 消息；`chatgpt` 则交给 ChatGPT 处理 |
 | `render.toolDescriptionMaxChars` | `2000` | 截断过长的工具描述，缩小第一条消息（0 表示不截断） |
 | `render.excludeTools` | `DesignSync`、`ScheduleWakeup`、`Cron*`、`Workflow`、`ReportFindings` | 不展示给模型的工具名（通过 ChatGPT 很少用得上，约 20 KB）。设为 `[]` 则全部展示 |
 | `render.maxPromptChars` | `100000` | 单条 ChatGPT 消息的长度上限；超出时会缩短较早的历史和过大的工具结果 |

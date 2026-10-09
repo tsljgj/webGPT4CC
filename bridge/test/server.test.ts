@@ -450,3 +450,72 @@ describe('reasoning summaries', () => {
     }
   });
 });
+
+describe('local answers and output-limit handling', () => {
+  it('answers WebFetch digests locally with the page content', async () => {
+    const ctx = await start(() => 'should not be used');
+    try {
+      const r = await post(ctx.url, '/v1/messages', {
+        model: 'claude-haiku-x',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: '\nWeb page content:\n---\n# Title\nBody text\n---\n\nWhat is the title?\n\nProvide a concise response based only on the content above.' }],
+      });
+      const j = (await r.json()) as { content: Array<{ text: string }> };
+      assert.match(j.content[0]!.text, /# Title\nBody text/);
+      assert.match(j.content[0]!.text, /What is the title\?/);
+      assert.equal(ctx.mock.jobs.length, 0);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+
+  it('answers HEAD and GET /api/hello without auth', async () => {
+    const ctx = await start(() => 'x');
+    try {
+      assert.equal((await fetch(ctx.url + '/api/hello', { method: 'HEAD' })).status, 200);
+      assert.equal((await fetch(ctx.url + '/api/hello')).status, 200);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+
+  it('drops a tool call cut off by the output limit and warns the model next turn', async () => {
+    const ctx = await start((_job, c) =>
+      c.turn === 0
+        ? 'Writing.\n<tool_call name="Bash">\n<param name="command">echo one</param>\n</tool_call>\n<tool_call name="Bash">\n<param name="command">cat > big.txt <<EOF\nlots of'
+        : 'ok',
+    );
+    // Make the mock report a max_tokens finish for the first turn.
+    const orig = ctx.mock.run.bind(ctx.mock);
+    ctx.mock.run = async function* (job, signal) {
+      for await (const ev of orig(job, signal)) yield ev.type === 'done' && ctx.mock.jobs.length === 1 ? { ...ev, finishReason: 'max_tokens' } : ev;
+    };
+    try {
+      const first = { model: 'm', max_tokens: 100, stream: true, tools: TOOLS, messages: [{ role: 'user', content: 'go' }] };
+      const r1 = assemble(parseSse(await (await post(ctx.url, '/v1/messages', first)).text()));
+      const calls = r1.content.filter((b) => b.type === 'tool_use');
+      assert.equal(calls.length, 1, 'only the complete call survives');
+      assert.deepEqual(calls[0]!.input, { command: 'echo one' });
+      await (
+        await post(ctx.url, '/v1/messages', {
+          ...first,
+          messages: [...first.messages, { role: 'assistant', content: r1.content }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: calls[0]!.id, content: 'one' }] }],
+        })
+      ).text();
+      assert.match(ctx.mock.jobs[1]!.prompt, /cut off by ChatGPT's output limit/);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+
+  it('refuses empty replies instead of returning nothing', async () => {
+    const ctx = await start(() => '   ');
+    try {
+      const r = await post(ctx.url, '/v1/messages', { model: 'm', max_tokens: 100, tools: TOOLS, messages: [{ role: 'user', content: 'empty' }] });
+      assert.equal(r.status, 500);
+      assert.equal(r.headers.get('x-should-retry'), 'false');
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+});

@@ -23,6 +23,8 @@ export interface ParsedToolCall {
   type: 'tool_use';
   name: string;
   input: Record<string, unknown>;
+  /** The reply ended inside this call (no closing tag / unterminated value). */
+  incomplete?: boolean;
 }
 
 export type ParsedBlock = ParsedText | ParsedToolCall;
@@ -89,6 +91,7 @@ interface CallParse {
   input: Record<string, unknown>;
   end: number;
   warnings: string[];
+  incomplete: boolean;
 }
 
 const PARAM_OPEN_RE = /^<(param|parameter|arg)\b([^>\n]*)>/;
@@ -105,11 +108,13 @@ function parseCall(text: string, openStart: number, openEnd: number, attrs: stri
   let p = openEnd;
   let end = -1;
   let guard = 0;
+  let incomplete = false;
   while (guard++ < 10_000) {
     p = skipWs(text, p);
     if (p >= text.length) {
       warnings.push(`tool_call "${name}" was not terminated with ${TOOL_CLOSE}`);
       end = text.length;
+      incomplete = true;
       break;
     }
     if (text.startsWith(TOOL_CLOSE, p)) {
@@ -133,6 +138,7 @@ function parseCall(text: string, openStart: number, openEnd: number, attrs: stri
       const vStart = p + (pm ? pm[0].length : elementMatch![0].length);
       const { value, next, warning, block } = readValue(text, vStart, close, pm ? tagName : null);
       if (warning) warnings.push(`${name}.${pname}: ${warning}`);
+      if (warning?.startsWith('missing')) incomplete = true;
       // Whole-file contents written as a block keep their final newline.
       if (pname) raw[pname] = block && WHOLE_FILE_PARAMS.has(pname) && value && !value.endsWith('\n') ? value + '\n' : value;
       else warnings.push(`${name}: <${tagName}> without a name attribute ignored`);
@@ -160,7 +166,10 @@ function parseCall(text: string, openStart: number, openEnd: number, attrs: stri
         warnings.push(`${name}: could not parse JSON tool_call body`);
       }
       end = closeAt === -1 ? text.length : closeAt + TOOL_CLOSE.length;
-      if (closeAt === -1) warnings.push(`tool_call "${name}" was not terminated with ${TOOL_CLOSE}`);
+      if (closeAt === -1) {
+        warnings.push(`tool_call "${name}" was not terminated with ${TOOL_CLOSE}`);
+        incomplete = true;
+      }
       break;
     }
     // Unknown content inside the call: skip to the next tag.
@@ -186,7 +195,7 @@ function parseCall(text: string, openStart: number, openEnd: number, attrs: stri
     const missing = schema.required.filter((r) => !(r in input));
     if (missing.length) warnings.push(`${resolved}: missing required parameter(s) ${missing.join(', ')}`);
   }
-  return { name: resolved, input, end, warnings };
+  return { name: resolved, input, end, warnings, incomplete };
 }
 
 function coerceUnknown(v: string): unknown {
@@ -274,7 +283,7 @@ export function parseReply(rawText: string, tools: ToolDefinition[] = []): Parse
     if (before.trim()) blocks.push({ type: 'text', text: calls === 0 ? before.replace(/\s+$/, '') : before.trim() });
     const call = parseCall(text, openStart, openEnd, m[1] ?? '', tools);
     warnings.push(...call.warnings);
-    blocks.push({ type: 'tool_use', name: call.name, input: call.input });
+    blocks.push(call.incomplete ? { type: 'tool_use', name: call.name, input: call.input, incomplete: true } : { type: 'tool_use', name: call.name, input: call.input });
     calls++;
     cursor = Math.max(call.end, openEnd);
   }

@@ -48,6 +48,11 @@ export interface BridgeConfig {
   /** Claude Code's WebSearch tool: answer with ChatGPT's own web search, or refuse. */
   webSearch: 'chatgpt' | 'disabled';
   /**
+   * Claude Code's WebFetch tool asks a small model to digest each fetched page.
+   * "local" returns the (truncated) page itself instead, saving a ChatGPT message per fetch.
+   */
+  webFetchSummaries: 'local' | 'chatgpt';
+  /**
    * Context window Claude Code should assume (CLAUDE_CODE_MAX_CONTEXT_TOKENS in the launcher).
    * Claude Code auto-compacts before reaching it, which keeps ChatGPT conversations small.
    */
@@ -82,13 +87,14 @@ export function defaultConfig(): BridgeConfig {
     newChatUrl: 'https://chatgpt.com/?model={model}',
     temporaryChats: false,
     conversationMode: 'continue',
-    maxConversationTokens: 150_000,
+    maxConversationTokens: 110_000,
     jobTimeoutMs: 20 * 60_000,
     workerWaitMs: 60_000,
     orphanGraceMs: 90_000,
     backgroundRequests: 'local',
     webSearch: 'chatgpt',
-    claudeContextWindow: 128_000,
+    webFetchSummaries: 'local',
+    claudeContextWindow: 120_000,
     stream: true,
     showThinking: true,
     render: { ...DEFAULT_RENDER_OPTIONS },

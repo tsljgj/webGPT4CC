@@ -171,6 +171,11 @@ export function protocolInstructions(tools: ToolDefinition[]): string {
 export const REMINDER_FOOTER =
   '[bridge reminder: to use tools write `<tool_call name="...">` blocks with `<param name="...">` values (raw strings, JSON for non-strings), batch independent calls in one reply, and stop right after the last `</tool_call>`. Reply with plain text only when you are done.]';
 
+/** The reminder plus the tool names, so the protocol survives ChatGPT dropping old context. */
+export function reminderFooter(tools: ToolDefinition[]): string {
+  return `${REMINDER_FOOTER.slice(0, -1)} Tools: ${tools.map((t) => t.name).join(', ')}.]`;
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 
@@ -324,7 +329,8 @@ function fitLatest(messages: MessageParam[], index: RenderCtx['index'], opts: Re
 }
 
 const HISTORY_INTRO =
-  '# Conversation so far\n\nThis conversation was started elsewhere; here is the transcript (your earlier turns are shown as role="assistant").';
+  '# Conversation so far\n\nThis conversation was started elsewhere; here is the transcript (your earlier turns are shown as role="assistant"). ' +
+  'Some earlier tool results may be shortened or omitted; if a result refers to content you cannot see (e.g. "file unchanged since last read"), read the file again.';
 
 /** Replay earlier messages within `budget` characters (newest messages are kept first). */
 function renderHistory(history: MessageParam[], index: RenderCtx['index'], opts: RenderOptions, budget: number): string {
@@ -406,10 +412,9 @@ function historyResultCaps(history: MessageParam[], opts: RenderOptions): number
 export function renderDeltaPrompt(req: MessagesRequest, fromIndex: number, opts: RenderOptions = DEFAULT_RENDER_OPTIONS): RenderedPrompt {
   const index = toolUseIndex(req.messages);
   const max = opts.maxPromptChars > 0 ? opts.maxPromptChars : Number.MAX_SAFE_INTEGER;
+  const tools = visibleTools(req.tools, opts);
   const footer =
-    opts.reminderFooter && visibleTools(req.tools, opts).length && !isTextOnlyRequest(req) && req.tool_choice?.type !== 'none'
-      ? `\n\n${REMINDER_FOOTER}`
-      : '';
+    opts.reminderFooter && tools.length && !isTextOnlyRequest(req) && req.tool_choice?.type !== 'none' ? `\n\n${reminderFooter(tools)}` : '';
   const note = toolChoiceNote(req);
   const body = fitLatest(req.messages.slice(fromIndex), index, opts, max - footer.length - note.length);
   return { text: (body || '(continue)') + note + footer, covered: req.messages.length };

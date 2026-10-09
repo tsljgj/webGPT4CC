@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import type { MessageParam, MessagesRequest } from '../src/anthropic/types.ts';
+import type { MessageParam, MessagesRequest, ToolDefinition } from '../src/anthropic/types.ts';
 import { DEFAULT_RENDER_OPTIONS, estimateRequestTokens, renderDeltaPrompt, renderFullPrompt, systemText } from '../src/translate/render.ts';
 
-const TOOLS = [
+const TOOLS: ToolDefinition[] = [
   { name: 'Bash', description: 'Run a shell command.', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
   { name: 'DesignSync', description: 'x'.repeat(5000), input_schema: { type: 'object', properties: {} } },
 ];

@@ -94,17 +94,28 @@ export function bridgeEnv(settings, model) {
     CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     CLAUDE_CODE_GATEWAY_HINT_HEADERS: '1',
+    CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1',
     DISABLE_PROMPT_CACHING: '1',
+    // Marks the child as a delegate so this plugin, loaded again inside it, refuses to recurse.
+    WEBGPT4CC_WORKER: '1',
   };
 }
 
-export function childEnv(settings, model, base = process.env, lite = false) {
+export function childEnv(settings, model, base = process.env) {
   const env = { ...base };
   for (const k of STRIPPED_ENV) delete env[k];
-  const overrides = bridgeEnv(settings, model);
-  // --bare only reads ANTHROPIC_API_KEY (sent as x-api-key, which the bridge accepts).
-  if (lite) overrides.ANTHROPIC_API_KEY = overrides.ANTHROPIC_AUTH_TOKEN;
-  return { ...env, ...overrides };
+  return { ...env, ...bridgeEnv(settings, model) };
+}
+
+/** Tools for lite delegates (no Agent tool, so no subagents opening more ChatGPT conversations). */
+export const LITE_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'WebFetch', 'WebSearch', 'NotebookEdit'];
+
+/** Why this session must not delegate, if it must not. */
+export function recursionProblem(env, settings) {
+  if (env.WEBGPT4CC_WORKER === '1') return 'This session is itself a webGPT4CC delegate; it cannot delegate further. Do the work directly.';
+  const base = (env.ANTHROPIC_BASE_URL || '').replace(/\/+$/, '');
+  if (base && base === settings.url) return 'This Claude Code session already runs on ChatGPT through the webGPT4CC bridge; do the work directly instead of delegating.';
+  return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +156,7 @@ export const TOOLS = [
         lite: {
           type: 'boolean',
           description:
-            'Run the delegate in Claude Code\'s --bare mode: only Bash, Read and Edit tools, a minimal system prompt, no CLAUDE.md, hooks or plugins. Its first ChatGPT message is ~20x smaller, which suits small tasks and ChatGPT plans with small context windows.',
+            'Give the delegate only the core tools (Bash, Read, Edit, Write, WebFetch, WebSearch, NotebookEdit; no subagents). Its first ChatGPT message is about 4x smaller, which suits most focused tasks and ChatGPT plans with small context windows.',
         },
       },
       required: ['task'],
@@ -262,7 +273,7 @@ export function delegateArgs(args, model, files = {}) {
   // The --settings layer beats an `env` block in the user's ~/.claude/settings.json,
   // which would otherwise silently route the delegate somewhere else.
   if (files.settings) out.push('--settings', files.settings);
-  if (args.lite) out.push('--bare');
+  if (args.lite) out.push('--tools', LITE_TOOLS.join(','));
   const allowed = Array.isArray(args.allowed_tools) && args.allowed_tools.length ? args.allowed_tools : DEFAULT_ALLOWED_TOOLS;
   out.push('--allowedTools', allowed.map(String).join(','));
   out.push('--permission-mode', ['default', 'acceptEdits', 'plan'].includes(args.permission_mode) ? args.permission_mode : 'acceptEdits');
@@ -341,6 +352,8 @@ async function delegateTool(args, settings, ctx) {
   if (!task) return textResult('`task` is required.', true);
   const problems = validateDelegateArgs(args);
   if (problems.length) return textResult(`Invalid arguments: ${problems.join('; ')}`, true);
+  const recursion = recursionProblem(process.env, settings);
+  if (recursion) return textResult(recursion, true);
   const health = await bridgeStatus(settings);
   if (!health.ok) return textResult(health.text, true);
   // Claude Code passes the project root through the plugin config (WEBGPT4CC_PROJECT_DIR).
@@ -359,7 +372,7 @@ async function delegateTool(args, settings, ctx) {
   }
   const cleanup = () => rmSync(tmp, { recursive: true, force: true });
   return await new Promise((resolvePromise) => {
-    const env = childEnv(settings, model, process.env, !!args.lite);
+    const env = childEnv(settings, model, process.env);
     const { command, shell } = resolveClaudeCommand(settings.claudeBin);
     const argv = delegateArgs(args, model, files);
     const child = spawn(shell ? cmdQuote(command) : command, shell ? argv.map(cmdQuote) : argv, {

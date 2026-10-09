@@ -56,6 +56,30 @@ function firstWords(s: string, n: number): string {
     .join(' ');
 }
 
+/** Claude Code's WebFetch digest request: page markdown plus the caller's prompt, no tools. */
+export function parseWebFetchRequest(req: MessagesRequest): { content: string; prompt: string } | null {
+  if ((req.tools ?? []).length) return null;
+  const text = lastUserText(req);
+  const m = /Web page content:\n---\n([\s\S]*)\n---\n\n([\s\S]*)$/.exec(text);
+  if (!m) return null;
+  const prompt = m[2]!.replace(/\n*Provide a concise response[\s\S]*$/, '').trim();
+  return { content: m[1]!, prompt };
+}
+
+export const WEBFETCH_LOCAL_MAX_CHARS = 20_000;
+
+/** Answer a WebFetch digest locally with the page itself (truncated). */
+export function localWebFetchReply(req: MessagesRequest): string | null {
+  const parsed = parseWebFetchRequest(req);
+  if (!parsed) return null;
+  const { content, prompt } = parsed;
+  const body =
+    content.length > WEBFETCH_LOCAL_MAX_CHARS
+      ? `${content.slice(0, WEBFETCH_LOCAL_MAX_CHARS)}\n\n[... ${content.length - WEBFETCH_LOCAL_MAX_CHARS} more characters truncated by webGPT4CC ...]`
+      : content;
+  return `[webGPT4CC returned the fetched page as-is instead of a summary${prompt ? `; the request was: ${prompt.slice(0, 300)}` : ''}]\n\n${body}`;
+}
+
 /**
  * Local answers for helper prompts whose output is cosmetic. Returns null when
  * the request is not one we recognise; those go to ChatGPT. Security-relevant

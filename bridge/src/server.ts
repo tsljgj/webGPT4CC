@@ -122,8 +122,9 @@ export function createBridgeServer(config: BridgeConfig, log: Logger, provider: 
       });
       return;
     }
-    if (req.method === 'HEAD') {
-      res.writeHead(200).end();
+    // Claude Code warms the connection with HEAD /api/hello (no auth) before requests.
+    if (req.method === 'HEAD' || path === '/api/hello') {
+      res.writeHead(200, { 'content-type': 'text/plain' }).end(req.method === 'HEAD' ? undefined : 'ok');
       return;
     }
     if (!path.startsWith('/v1/')) {

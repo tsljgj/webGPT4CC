@@ -92,6 +92,9 @@ gptcc -p "add input validation to src/api.ts and run the tests"
 ```
 
 `gptcc` is `claude` with the bridge environment. Any `claude` flags work.
+Add `--lite` to give Claude Code only the core tools (Bash, Read, Edit, Write, WebFetch,
+WebSearch, NotebookEdit, AskUserQuestion; no subagents). The first ChatGPT message then
+shrinks from about 45 KB to about 20 KB, which helps on plans with small context windows.
 It starts in the `default` permission mode, because Claude Code's `auto` mode makes
 two very large extra model calls per tool use. To use another client, run
 `eval "$(webgpt4cc env)"` (or `webgpt4cc env --shell powershell`) and then `claude`.
@@ -105,7 +108,8 @@ two very large extra model calls per tool use. To use another client, run
 
 Then ask Claude to "delegate this to GPT", or use `/gpt-web:delegate <task>`,
 `/gpt-web:ask <question>` or `/gpt-web:status`. The delegate gets read, search and edit
-tools by default. Claude can grant `Bash(...)` rules per task.
+tools by default. Claude can grant `Bash(...)` rules per task, and pass `lite: true` for a
+smaller, faster delegate. A delegate cannot delegate again.
 
 **From your own code (Claude Agent SDK):** see [examples/agent-sdk.ts](examples/agent-sdk.ts).
 
@@ -124,10 +128,11 @@ tools by default. Claude can grant `Bash(...)` rules per task.
 | `newChatUrl` | `https://chatgpt.com/?model={model}` | URL for new chats. Use a project URL to keep bridge chats in one ChatGPT project |
 | `temporaryChats` | `false` | Open new chats as temporary chats (not saved to history, no memory) |
 | `conversationMode` | `continue` | `stateless` starts a new chat for every request |
-| `maxConversationTokens` | `150000` | Start a fresh chat (replaying the transcript) beyond this size |
-| `claudeContextWindow` | `128000` | Context window Claude Code compacts against (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`) |
+| `maxConversationTokens` | `110000` | Start a fresh chat (replaying the transcript) beyond this size |
+| `claudeContextWindow` | `120000` | Context window Claude Code compacts against (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`) |
 | `jobTimeoutMs` | `1200000` | Max time for one ChatGPT reply |
 | `webSearch` | `chatgpt` | Claude Code's WebSearch tool uses ChatGPT's own browsing; `disabled` refuses it |
+| `webFetchSummaries` | `local` | WebFetch normally asks a small model to digest each page. `local` returns the page itself (truncated to 20k characters) instead, which saves a ChatGPT message per fetch; `chatgpt` sends it to ChatGPT |
 | `render.toolDescriptionMaxChars` | `2000` | Truncate long tool descriptions to keep the first message small (0 = full) |
 | `render.excludeTools` | `DesignSync`, `ScheduleWakeup`, `Cron*`, `Workflow`, `ReportFindings` | Tool names never shown to the model (rarely useful through ChatGPT, about 20 KB). `[]` shows everything |
 | `render.maxPromptChars` | `100000` | Upper bound for one ChatGPT message; older history and huge tool results are shortened to fit |

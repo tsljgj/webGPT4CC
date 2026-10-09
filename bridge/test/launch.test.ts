@@ -13,7 +13,7 @@ describe('launcher', () => {
     assert.equal(env.ANTHROPIC_API_KEY, undefined);
     assert.equal(env.CLAUDECODE, undefined);
     assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1');
-    assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '128000');
+    assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '120000');
     assert.equal(env.PATH, '/bin');
   });
 
@@ -48,5 +48,15 @@ describe('model resolution', () => {
     assert.equal(buildNewChatUrl('https://chatgpt.com/?model={model}', 'gpt-5-5', false), 'https://chatgpt.com/?model=gpt-5-5');
     assert.equal(buildNewChatUrl('https://chatgpt.com/?model={model}', '', true), 'https://chatgpt.com/?temporary-chat=true');
     assert.equal(buildNewChatUrl('https://chatgpt.com/?model={model}', 'x', true), 'https://chatgpt.com/?model=x&temporary-chat=true');
+  });
+});
+
+describe('lite mode', () => {
+  it('expands --lite into a small --tools list', async () => {
+    const { claudeArgs, LITE_TOOLS } = await import('../src/launch.ts');
+    const a = claudeArgs(['--lite', '-p', 'x']);
+    assert.deepEqual(a.slice(0, 4), ['--permission-mode', 'default', '--tools', LITE_TOOLS.join(',')]);
+    assert.ok(!a.includes('--lite'));
+    assert.ok(!LITE_TOOLS.includes('Agent'));
   });
 });

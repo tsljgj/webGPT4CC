@@ -57,6 +57,8 @@ export function claudeEnv(config: BridgeConfig, model?: string): Record<string, 
     CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: '3600000',
     // Failed turns are retried by the bridge's own logic; identical retries are deduplicated.
     CLAUDE_CODE_MAX_RETRIES: '3',
+    // No silent stream:false re-send of the same turn after a stream hiccup.
+    CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1',
     // "chatgpt-web" is unknown to Claude Code; tell it the window to compact against.
     CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(config.claudeContextWindow),
     // No telemetry/bootstrap calls to Anthropic, no extra model calls that would each
@@ -101,9 +103,24 @@ function hasFlag(args: string[], flags: string[]): boolean {
  * - add the bridge settings layer, unless the user passes their own --settings.
  */
 export function claudeArgs(args: string[], env?: Record<string, string>): string[] {
+  args = expandLite(args);
   const out = hasFlag(args, PERMISSION_FLAGS) ? [...args] : ['--permission-mode', 'default', ...args];
   if (env && !hasFlag(args, ['--settings'])) out.unshift('--settings', claudeSettings(env));
   return out;
+}
+
+/**
+ * Tools for `--lite`: drops the Agent tool (no subagents, each of which would open its own
+ * ChatGPT conversation) and the large niche tools. The first ChatGPT message shrinks to ~20 KB.
+ */
+export const LITE_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'WebFetch', 'WebSearch', 'NotebookEdit', 'AskUserQuestion'];
+
+/** Translate the launcher's own `--lite` flag into `--tools`. */
+export function expandLite(args: string[]): string[] {
+  const i = args.indexOf('--lite');
+  if (i < 0) return args;
+  const rest = [...args.slice(0, i), ...args.slice(i + 1)];
+  return hasFlag(rest, ['--tools']) ? rest : ['--tools', LITE_TOOLS.join(','), ...rest];
 }
 
 /** `--bare` mode only reads ANTHROPIC_API_KEY (sent as x-api-key, which the bridge accepts). */

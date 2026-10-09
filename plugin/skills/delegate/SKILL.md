@@ -28,7 +28,8 @@ browser extension). That agent:
    "done" means, and how to verify (commands to run, if Bash is allowed).
 3. Call `delegate` with `task` = the brief. Pick `allowed_tools` deliberately; add
    `Bash(...)` rules only for the commands the task needs. Use `max_turns` to bound
-   cost for small tasks (e.g. 15).
+   cost for small tasks (e.g. 15). Pass `lite: true` for focused tasks: the delegate then gets
+   only the core tools (no subagents) and its first ChatGPT message is about 4x smaller.
 4. Long runs move to the background automatically; you'll get the result as a task
    notification. Keep working on other things meanwhile if useful.
 5. **Review the result**: read the files it changed (listed in the result) and check

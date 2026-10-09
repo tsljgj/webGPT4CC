@@ -13,7 +13,7 @@ import type {
 import { SseMessageWriter, buildMessageResponse, newMessageId, newToolUseId, sendJson, sendJsonError } from './anthropic/sse.ts';
 import { type BridgeConfig, resolveChatModel } from './config.ts';
 import type { Logger } from './log.ts';
-import { localBackgroundReply, classifyRequest, webSearchPrompt, type RequestKind } from './background.ts';
+import { localBackgroundReply, localWebFetchReply, classifyRequest, webSearchPrompt, type RequestKind } from './background.ts';
 import type { ChatEvent, ChatJob, ChatProvider, ConversationTarget, ProviderErrorCode } from './providers/types.ts';
 import {
   ResponseCache,
@@ -32,6 +32,9 @@ import {
   visibleTools,
 } from './translate/render.ts';
 
+const TRUNCATED_NOTE =
+  '[Note from the bridge: your previous reply was cut off by ChatGPT\'s output limit inside a tool call. That incomplete call was discarded and NOT executed. Re-issue it; split large file contents across several smaller Write/Edit calls.]';
+
 export interface Completed {
   blocks: ResponseBlock[];
   stopReason: StopReason;
@@ -46,6 +49,8 @@ export interface BridgeState {
   log: Logger;
   /** Conversations whose last reply was interrupted (next message gets a note). */
   interrupted: Set<string>;
+  /** One-off notes to prepend to the next message of a conversation. */
+  notes: Map<string, string>;
   /**
    * Turns whose client went away. They keep running for a grace period so that
    * a retry of the same request (Claude Code retries after stream watchdog
@@ -66,6 +71,7 @@ export function createState(config: BridgeConfig, provider: ChatProvider, log: L
     cache: new ResponseCache<Completed>(),
     log,
     interrupted: new Set(),
+    notes: new Map(),
     orphans: new Map(),
     rateLimitedUntil: 0,
     rateLimitMessage: '',
@@ -79,11 +85,14 @@ export class BridgeError extends Error {
   readonly retryAfterMs?: number;
   /** Provider error code this error was mapped from, if any. */
   providerCode?: ProviderErrorCode;
-  constructor(type: ErrorType, message: string, retryable: boolean, retryAfterMs?: number) {
+  /** HTTP status to use instead of the default for `type`. */
+  status?: number;
+  constructor(type: ErrorType, message: string, retryable: boolean, retryAfterMs?: number, status?: number) {
     super(message);
     this.type = type;
     this.retryable = retryable;
     this.retryAfterMs = retryAfterMs;
+    this.status = status;
   }
 }
 
@@ -96,10 +105,13 @@ function providerErrorToBridge(code: ProviderErrorCode, message: string, retryAf
 function mapProviderError(code: ProviderErrorCode, message: string, retryAfterMs?: number): BridgeError {
   switch (code) {
     case 'no_worker':
+      // The provider already waited workerWaitMs for a tab; fail fast (Claude Code retries a 529 three times).
       return new BridgeError(
-        'overloaded_error',
+        'api_error',
         `${message} — open https://chatgpt.com in Chrome with the webGPT4CC extension connected (see \`webgpt4cc doctor\`).`,
-        true,
+        false,
+        undefined,
+        503,
       );
     case 'rate_limited':
       return new BridgeError('rate_limit_error', `ChatGPT usage limit: ${message}`, false, retryAfterMs);
@@ -108,7 +120,8 @@ function mapProviderError(code: ProviderErrorCode, message: string, retryAfterMs
       // which makes it compact the conversation.
       return new BridgeError('invalid_request_error', `prompt is too long: ${message}`, false);
     case 'not_logged_in':
-      return new BridgeError('authentication_error', `ChatGPT is not logged in: ${message}`, false);
+      // 403 is not retried by Claude Code (401 would be retried for ~3 minutes).
+      return new BridgeError('permission_error', `ChatGPT is not logged in (or shows a verification challenge) in the worker tab: ${message}`, false);
     case 'timeout':
       return new BridgeError('api_error', `ChatGPT did not finish in time: ${message}`, true);
     case 'aborted':
@@ -127,7 +140,7 @@ function mapProviderError(code: ProviderErrorCode, message: string, retryAfterMs
 function sendBridgeError(res: ServerResponse, err: BridgeError): void {
   const headers: Record<string, string> = { 'x-should-retry': err.retryable ? 'true' : 'false' };
   if (err.retryAfterMs) headers['retry-after'] = String(Math.ceil(err.retryAfterMs / 1000));
-  sendJsonError(res, err.type, err.message, headers);
+  sendJsonError(res, err.type, err.message, headers, err.status);
 }
 
 function usage(input: number, output: number): Usage {
@@ -170,6 +183,8 @@ function planTurn(state: BridgeState, req: MessagesRequest, kind: RequestKind, c
       const turn = state.sessions.lookup(fp, i, contextHash(req, chatModel));
       if (turn && turn.conversationTokens < config.maxConversationTokens) {
         let prompt = renderDeltaPrompt(reqForRender, i + 1, config.render).text;
+        const note = state.notes.get(turn.conversationId);
+        if (note) prompt = `${note}\n\n${prompt}`;
         if (state.interrupted.has(turn.conversationId)) {
           prompt =
             '[Note from the bridge: your previous reply was interrupted by the user before it was used. None of its tool calls were executed; continue from the message below.]\n\n' +
@@ -290,8 +305,12 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   const inputTokens = estimateRequestTokens(req, config.render);
   log.debug(`request model=${req.model} kind=${kind} messages=${req.messages.length} tools=${req.tools?.length ?? 0} stream=${stream}`);
 
-  // 1. Requests we answer locally (quota probes, optional background helpers).
-  const local = kind === 'probe' || (kind === 'background' && config.backgroundRequests === 'local') ? localBackgroundReply(req, kind) : null;
+  // 1. Requests we answer locally (quota probes, WebFetch digests, optional background helpers).
+  let local = kind === 'probe' || (kind === 'background' && config.backgroundRequests === 'local') ? localBackgroundReply(req, kind) : null;
+  if (!local && kind === 'background' && config.webFetchSummaries === 'local') {
+    const page = localWebFetchReply(req);
+    if (page !== null) local = { text: page, stopReason: 'end_turn' };
+  }
   if (local !== null) {
     state.stats.localReplies++;
     const blocks: ResponseBlock[] = [{ type: 'text', text: local.text }];
@@ -331,7 +350,9 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
 
   // 2. Deduplicate client retries of an identical request.
   const chatModel = resolved.slug;
-  const rHash = requestHash(req, chatModel, header('x-claude-code-session-id'));
+  // Subagents share the session id; x-claude-code-agent-id tells them apart.
+  const scope = header('x-claude-code-session-id') ? `${header('x-claude-code-session-id')}/${header('x-claude-code-agent-id') || 'main'}` : '';
+  const rHash = requestHash(req, chatModel, scope);
   const cached = state.cache.get(rHash);
   if (cached) {
     const orphan = state.orphans.get(rHash);
@@ -436,7 +457,26 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     state.stats.chatgptTurns++;
     const parsed = parseReply(result.text, plan.tools);
     for (const w of parsed.warnings) log.warn(`parser: ${w}`);
-    const done = finalize(parsed, emitted, result.finishReason);
+    // A reply cut off by ChatGPT's output limit must not run a half-written tool call
+    // (e.g. a Write with truncated content). Drop it and tell the model next turn.
+    // (A call that merely lacks its final </tool_call> after a natural stop is kept.)
+    const cutOff = result.finishReason === 'max_tokens' || result.finishReason === 'interrupted';
+    const lastBlock = parsed.blocks[parsed.blocks.length - 1];
+    let finishReason = result.finishReason;
+    if (cutOff && lastBlock?.type === 'tool_use' && lastBlock.incomplete) {
+      parsed.blocks.pop();
+      parsed.toolCalls--;
+      log.warn(`dropped an incomplete ${lastBlock.name} call (reply cut off: ${result.finishReason})`);
+      if (plan.kind === 'main') state.notes.set(result.conversationId, TRUNCATED_NOTE);
+      if (!parsed.blocks.length) parsed.blocks.push({ type: 'text', text: '(The ChatGPT reply was cut off by its output limit.)' });
+      finishReason = 'max_tokens';
+    }
+    if (!parsed.blocks.some((b) => b.type === 'tool_use' || b.text.trim())) {
+      // Claude Code would answer an empty reply with "[Your previous response had no visible output...]",
+      // costing another ChatGPT message; surface it instead.
+      throw new BridgeError('api_error', 'ChatGPT returned an empty reply (it may have been blocked by moderation, or the page changed). Check the worker tab.', false);
+    }
+    const done = finalize(parsed, emitted, finishReason);
     // Remember the turn so the next request can continue this ChatGPT conversation.
     if (plan.kind === 'main') {
       const assistantIndex = req.messages.length; // index the reply will have in the next request
@@ -452,6 +492,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
         turns: (plan.fromTurn?.turns ?? 0) + 1,
       });
       state.interrupted.delete(result.conversationId);
+      if (plan.conversation.kind === 'continue' && state.notes.get(result.conversationId) !== TRUNCATED_NOTE) state.notes.delete(result.conversationId);
     }
     finished = true;
     clearOrphan(state, rHash);

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { delegateArgs, resolveClaudeCommand, summarizeStream } from '../mcp/server.mjs';
+import { delegateArgs, recursionProblem, resolveClaudeCommand, summarizeStream } from '../mcp/server.mjs';
 
 const SERVER = fileURLToPath(new URL('../mcp/server.mjs', import.meta.url));
 const FAKE_CLAUDE = fileURLToPath(new URL('./fake-claude.mjs', import.meta.url));
@@ -115,6 +115,7 @@ describe('webgpt4cc MCP server', () => {
     assert.equal(echoed.base, bridge.url);
     assert.equal(echoed.token, 'tok');
     assert.equal(echoed.claudecode, null, 'CLAUDECODE must not leak into the child');
+    assert.equal(echoed.settings.env.WEBGPT4CC_WORKER, '1');
     assert.equal(echoed.apiKey, null, 'ANTHROPIC_API_KEY must not leak into the child');
     assert.deepEqual(echoed.args.slice(0, 4), ['-p', '--output-format', 'stream-json', '--verbose']);
     assert.ok(echoed.args.includes('Read,Edit'));
@@ -179,6 +180,13 @@ describe('helpers', () => {
     assert.ok(!a[a.indexOf('--allowedTools') + 1].includes('Bash'));
     assert.equal(a[a.indexOf('--permission-mode') + 1], 'acceptEdits');
     assert.equal(delegateArgs({ permission_mode: 'bypassPermissions' }, 'm')[delegateArgs({ permission_mode: 'bypassPermissions' }, 'm').indexOf('--permission-mode') + 1], 'acceptEdits');
+  });
+
+  it('refuses to delegate from a delegate or from a session already on the bridge', () => {
+    const settings = { url: 'http://127.0.0.1:8765' };
+    assert.match(recursionProblem({ WEBGPT4CC_WORKER: '1' }, settings), /itself a webGPT4CC delegate/);
+    assert.match(recursionProblem({ ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/' }, settings), /already runs on ChatGPT/);
+    assert.equal(recursionProblem({ ANTHROPIC_BASE_URL: 'https://api.anthropic.com' }, settings), '');
   });
 
   it('only uses a shell on Windows when no claude.exe is found', () => {

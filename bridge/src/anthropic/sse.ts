@@ -38,13 +38,13 @@ export function statusForError(type: ErrorType): number {
   return STATUS_FOR_ERROR[type] ?? 500;
 }
 
-export function sendJsonError(res: ServerResponse, type: ErrorType, message: string, extraHeaders: Record<string, string> = {}): void {
+export function sendJsonError(res: ServerResponse, type: ErrorType, message: string, extraHeaders: Record<string, string> = {}, status?: number): void {
   if (res.headersSent) {
     res.end();
     return;
   }
   const body = errorBody(type, message);
-  res.writeHead(statusForError(type), {
+  res.writeHead(status ?? statusForError(type), {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(body),
     ...extraHeaders,
