@@ -428,6 +428,8 @@ describe('session persistence', () => {
     ).text();
     assert.equal(b.mock.jobs[0]!.conversation.kind, 'continue');
     await b.bridge.close();
+    const { rmSync } = await import('node:fs');
+    rmSync(join(sessionFile, '..'), { recursive: true, force: true });
   });
 });
 
@@ -606,5 +608,7 @@ describe('hardening', () => {
       assert.equal(statSync(dir).mode & 0o777, 0o700);
       for (const f of readdirSync(dir)) assert.equal(statSync(join(dir, f)).mode & 0o777, 0o600);
     }
+    const { rmSync } = await import('node:fs');
+    rmSync(join(dir, '..'), { recursive: true, force: true });
   });
 });

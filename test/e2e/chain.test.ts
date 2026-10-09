@@ -4,13 +4,15 @@
 // Skipped until extension/manifest.json exists (and when the claude CLI is missing).
 // Scenarios share one browser, bridge and worker tab and run in order; the 429
 // scenario must stay last because the bridge then fails fast for `clears_in`.
+// SSE bodies stream in small slices over time (the fake's loopback stream server).
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, it, type TestContext } from 'node:test';
 import type { ChatEvent } from '../../bridge/src/providers/types.ts';
 import type { FakeLlm, RecordedRequest } from './fake-chatgpt/backend.ts';
-import { chainSkipReason, type Chain, type ClaudeRun, runClaude, startChain, tempDir } from './harness.ts';
+import { reduceSse } from './fake-chatgpt/delta.ts';
+import { chainSkipReason, type Chain, type ClaudeRun, runClaude, startChain, tempDir, waitForWorker } from './harness.ts';
 
 const skip = chainSkipReason();
 
@@ -46,7 +48,8 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
   };
 
   before(async () => {
-    chain = await startChain({ fake: { llm: (prompt, ctx) => llm(prompt, ctx) } });
+    // A short workerWaitMs keeps the logged-out scenario quick (one worker, so affinity waits do not matter).
+    chain = await startChain({ fake: { llm: (prompt, ctx) => llm(prompt, ctx) }, bridge: { workerWaitMs: 8_000 } });
   });
   after(async () => {
     await chain?.close();
@@ -134,6 +137,25 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
         events.some((e) => e.event.type === 'status' && e.event.status === 'submitted'),
         'the extension reports status "submitted"',
       );
+      // The SSE body arrives in slices, so the first turn streams: the reasoning summary
+      // as status "thinking" (never the answer), then growing `text` prefixes of the reply.
+      // (Whole-body delivery, the no-openssl fallback, reaches the page in one read.)
+      const streamed = r1.delivery === 'stream';
+      const firstJob = events.find((e) => e.event.type === 'done')!.jobId;
+      const thinking = events
+        .filter((e) => e.jobId === firstJob && e.event.type === 'status' && e.event.status === 'thinking' && e.event.detail)
+        .map((e) => (e.event as { detail: string }).detail);
+      if (streamed) assert.ok(thinking.length >= 1, 'the reasoning summary was streamed as status "thinking"');
+      for (const d of thinking) {
+        assert.match(d, /^Reading the request/);
+        assert.doesNotMatch(d, /<tool_call|Creating the file now\.\n.*I'll create/s);
+      }
+      const texts = events.filter((e) => e.jobId === firstJob && e.event.type === 'text').map((e) => (e.event as { text: string }).text);
+      if (streamed) assert.ok(texts.length >= 1, 'text events streamed before done');
+      texts.forEach((x, i) => {
+        assert.ok(firstReply.startsWith(x), `text event ${i} is not a prefix of the final reply: ${JSON.stringify(x.slice(-60))}`);
+        if (i) assert.ok(x.length >= texts[i - 1]!.length, `text event ${i} shrank`);
+      });
       // The worker tab ends up on the conversation URL.
       assert.equal(new URL(chain.page.url()).pathname, `/c/${r1.responseConversationId}`);
     }),
@@ -183,7 +205,122 @@ describe('full chain: claude CLI -> bridge -> extension -> fake chatgpt.com', { 
     }),
   );
 
-  it('scenario 3: ChatGPT HTTP 429 becomes a quick, non-retried claude error (keep last)', { timeout: 180_000 }, (t) =>
+  it('scenario 3: a stream that breaks mid-answer is recovered from the conversation API, then continued', { timeout: 300_000 }, (t) =>
+    scenario(t, async () => {
+      const work = workDir();
+      const target = join(work, 'recovered.txt');
+      const content = 'line 1\n  line 2 (indented)\n<tag> & "quotes"\n';
+      const firstReply = `Writing the file.\n<tool_call name="Write">\n<param name="file_path">${target}</param>\n<param name="content">\n${content}</param>\n</tool_call>`;
+      llm = (prompt) => {
+        // The connection drops halfway through the tool call: the page only ever holds a truncated reply.
+        if (prompt.includes('# Bridge instructions')) return { text: firstReply, cutStream: 'mid-answer' };
+        if (prompt.includes('<tool_result')) return 'Recovered and done.';
+        return 'OK';
+      };
+      const { result: run, requests, events } = await capture(() => runClaude({ config: chain.bridge.config, prompt: 'write recovered.txt', cwd: work }));
+      t.diagnostic(summary(run).split('\n')[0]!);
+      assert.equal(run.timedOut, false, summary(run));
+      assert.equal(run.code, 0, summary(run));
+      assert.equal(run.json?.result, 'Recovered and done.', summary(run));
+      assert.equal(readFileSync(target, 'utf8'), content);
+
+      const main = requests.filter((r) => !isHelperPrompt(r.prompt));
+      assert.equal(main.length, 2, 'no retry: the broken turn was recovered, not re-sent');
+      assert.equal(main[0]!.cut, true);
+      assert.equal(reduceSse(main[0]!.responseBody!).complete, false, 'the wire only carried part of the reply');
+      assert.equal(main[1]!.conversationId, main[0]!.responseConversationId, 'the recovered conversation is continued');
+      assert.equal(main[1]!.parentMessageId, main[0]!.assistantMessageId);
+
+      const firstJob = events.find((e) => e.event.type === 'done')!.jobId;
+      assert.ok(
+        events.some((e) => e.jobId === firstJob && e.event.type === 'status' && e.event.status === 'recovering'),
+        'the extension reported status "recovering"',
+      );
+      const done = events.find((e) => e.jobId === firstJob && e.event.type === 'done')!.event as Extract<ChatEvent, { type: 'done' }>;
+      assert.equal(done.text, firstReply, 'the full reply was read back from GET /backend-api/conversation/{id}');
+      assert.equal(done.messageId, main[0]!.assistantMessageId);
+    }),
+  );
+
+  it('scenario 4: `claude --continue` after another session navigates the tab back to the first ChatGPT conversation', { timeout: 300_000 }, (t) =>
+    scenario(t, async () => {
+      const workA = workDir();
+      const workB = workDir();
+      const homeA = workDir(); // session A's Claude Code state, kept for --continue
+      llm = (prompt) => {
+        if (prompt.includes('now say bye')) return 'A says bye.';
+        if (prompt.includes('session B:')) return 'B says hi.';
+        if (prompt.includes('session A:')) return 'A says hi.';
+        return 'OK';
+      };
+      const { result: runs, requests, events } = await capture(async () => [
+        await runClaude({ config: chain.bridge.config, prompt: 'session A: say hi', cwd: workA, home: homeA }),
+        await runClaude({ config: chain.bridge.config, prompt: 'session B: say hi', cwd: workB }),
+        await runClaude({ config: chain.bridge.config, prompt: 'now say bye', cwd: workA, home: homeA, args: ['--continue'] }),
+      ]);
+      for (const run of runs) t.diagnostic(summary(run).split('\n')[0]!);
+      assert.deepEqual(
+        runs.map((r) => [r.code, r.json?.result]),
+        [
+          [0, 'A says hi.'],
+          [0, 'B says hi.'],
+          [0, 'A says bye.'],
+        ],
+        runs.map(summary).join('\n'),
+      );
+      const find = (text: string) => {
+        const r = requests.find((x) => x.prompt.includes(text));
+        assert.ok(r, `a ChatGPT request containing ${JSON.stringify(text)}`);
+        return r;
+      };
+      const a1 = find('session A:');
+      const b1 = find('session B:');
+      const a2 = find('now say bye');
+      assert.equal(a1.conversationId, undefined);
+      assert.equal(b1.conversationId, undefined, 'session B started its own chat');
+      assert.notEqual(b1.responseConversationId, a1.responseConversationId);
+      // The resumed session continues ChatGPT conversation A with only the new turn.
+      assert.equal(a2.conversationId, a1.responseConversationId, 'resumed session A continues its ChatGPT conversation');
+      assert.equal(a2.parentMessageId, a1.assistantMessageId);
+      assert.equal(a2.parentIsCurrentNode, true);
+      assert.doesNotMatch(a2.prompt, /# Bridge instructions|session A:/, 'only the new turn is sent');
+      // The tab was on conversation B, so the extension navigated to /c/<A> and the page loaded it.
+      const lastJob = events.findLast((e) => e.event.type === 'done')!.jobId;
+      assert.ok(
+        events.some((e) => e.jobId === lastJob && e.event.type === 'status' && e.event.status === 'navigating'),
+        'the extension navigated for the continued conversation',
+      );
+      assert.equal(new URL(chain.page.url()).pathname, `/c/${a1.responseConversationId}`);
+    }),
+  );
+
+  it('scenario 5: a logged-out worker tab fails the request after workerWaitMs instead of hanging', { timeout: 180_000 }, (t) =>
+    scenario(t, async () => {
+      const work = workDir();
+      llm = () => 'should not be called';
+      const provider = chain.bridge.provider;
+      chain.fake.options.loggedIn = false;
+      try {
+        await chain.page.reload();
+        // The extension keeps the tab registered but reports it as not ready (login screen).
+        await waitForWorker(provider, (w) => !w.ready && !w.busy, 20_000);
+        const { result: run, requests } = await capture(() => runClaude({ config: chain.bridge.config, prompt: 'say hi', cwd: work, timeoutMs: 150_000 }));
+        t.diagnostic(summary(run).split('\n')[0]!);
+        assert.equal(run.timedOut, false, summary(run));
+        assert.ok(run.code !== 0 || run.json?.is_error === true, `claude should fail: ${summary(run)}`);
+        assert.match(String(run.json?.result ?? run.stdout), /none is ready|logged out/i, summary(run));
+        const waitMs = chain.bridge.config.workerWaitMs;
+        assert.ok(run.durationMs < waitMs + 30_000, `took ${run.durationMs} ms (workerWaitMs ${waitMs})`);
+        assert.equal(requests.length, 0, 'nothing was sent to ChatGPT');
+      } finally {
+        chain.fake.options.loggedIn = true;
+        await chain.page.reload();
+        await waitForWorker(provider);
+      }
+    }),
+  );
+
+  it('scenario 6: ChatGPT HTTP 429 becomes a quick, non-retried claude error (keep last)', { timeout: 180_000 }, (t) =>
     scenario(t, async () => {
       const work = workDir();
       llm = () => 'should not be called';

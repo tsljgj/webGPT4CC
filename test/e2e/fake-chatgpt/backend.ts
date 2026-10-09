@@ -9,7 +9,7 @@
 // piece, so by default (`sseDelivery: 'stream'`) the conversation POST is
 // continued to a loopback HTTPS server (stream-server.ts) that writes the body in
 // small byte slices over time, like the real site, and can drop the connection
-// midway (FakeReply.cutAfterEvents). The page still sees https://chatgpt.com/…
+// midway (FakeReply.cutStream). The page still sees https://chatgpt.com/…
 // Contexts must be created with `ignoreHTTPSErrors: true` (see
 // FAKE_CONTEXT_OPTIONS). Without openssl the fake falls back to whole bodies.
 // The WebSocket handoff mode delivers its frames one by one with real delays.
@@ -38,12 +38,14 @@ export interface FakeReply {
   /** Answer the POST with this status and JSON body instead of a stream. */
   httpError?: { status: number; body: unknown };
   /**
-   * Drop the HTTP connection in the middle of the SSE event that follows the
-   * first `cutAfterEvents` events (a broken stream: the page's read() rejects;
-   * with whole-body delivery the body just ends there). The turn is still stored
-   * complete, so GET /backend-api/conversation/{id} returns the full answer.
+   * Drop the HTTP connection partway (a broken stream: the page's read() rejects;
+   * with whole-body delivery the body just ends early). A number cuts in the
+   * middle of the SSE event that follows that many events; 'mid-answer' cuts
+   * halfway through the answer's text deltas. The turn is still stored complete,
+   * so GET /backend-api/conversation/{id} returns the full answer, as the real
+   * backend does once generation has finished server-side.
    */
-  cutAfterEvents?: number;
+  cutStream?: number | 'mid-answer';
 }
 
 export interface LlmContext {
@@ -123,7 +125,7 @@ export interface RecordedRequest {
   delivery?: 'stream' | 'whole';
   /** 'stream' delivery: number of slices written (set when the response ended). */
   slices?: number;
-  /** The connection was dropped on purpose (FakeReply.cutAfterEvents). */
+  /** The connection was dropped on purpose (FakeReply.cutStream). */
   cut?: boolean;
   /** 'stream' delivery: the page stopped reading before the body ended (normal after message_stream_complete). */
   readerAborted?: boolean;
@@ -180,7 +182,8 @@ export class FakeChatGPT {
       wsFrameDelayMs: 25,
       wsCatchups: 3,
       log: false,
-      sseDelivery: 'stream',
+      // E2E_SSE_DELIVERY=whole exercises the fallback used when openssl is missing.
+      sseDelivery: process.env.E2E_SSE_DELIVERY === 'whole' ? 'whole' : 'stream',
       sseSliceDelayMs: 4,
       ...options,
     };
@@ -521,9 +524,17 @@ export class FakeChatGPT {
 
     rec.responseBody = formatSse(stream.http);
     let cutAtByte: number | undefined;
-    if (reply.cutAfterEvents !== undefined) {
+    if (reply.cutStream !== undefined) {
+      let n = typeof reply.cutStream === 'number' ? reply.cutStream : 0;
+      if (reply.cutStream === 'mid-answer') {
+        // Between the answer's first-token marker and its final patch (just before message_stream_complete).
+        const first = stream.http.findIndex((e) => e.data.includes('"user_visible_token"'));
+        const complete = stream.http.findIndex((e) => e.data.includes('"message_stream_complete"'));
+        if (first < 0 || complete < 0) throw new Error('cutStream "mid-answer" needs the answer in the HTTP stream (not with a WebSocket handoff)');
+        n = Math.floor((first + complete) / 2);
+      }
       // Cut halfway through the next event, so the page is left with a partial line.
-      const n = Math.max(0, Math.min(reply.cutAfterEvents, stream.http.length - 1));
+      n = Math.max(0, Math.min(n, stream.http.length - 1));
       cutAtByte = Buffer.byteLength(formatSse(stream.http.slice(0, n))) + Math.floor(Buffer.byteLength(formatSse([stream.http[n]!])) / 2);
       rec.cut = true;
       rec.responseBody = Buffer.from(rec.responseBody, 'utf8').subarray(0, cutAtByte).toString('utf8');
@@ -551,7 +562,9 @@ export class FakeChatGPT {
         },
         new URL(route.request().url()).pathname,
       );
-      await route.continue({ url }).catch(() => {});
+      // Chromium re-checks the referrer against the new (cross-origin) URL and blocks
+      // a full-path referrer (ERR_BLOCKED_BY_CLIENT): send the origin only.
+      await route.continue({ url, headers: { ...route.request().headers(), referer: 'https://chatgpt.com/' } }).catch(() => {});
       return 200;
     }
     rec.delivery = 'whole';

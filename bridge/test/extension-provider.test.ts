@@ -265,4 +265,69 @@ describe('extension provider readiness', () => {
       await bridge.close();
     }
   });
+
+  it('keeps a job queued behind a busy worker for longer than workerWaitMs', async () => {
+    const config: BridgeConfig = { ...defaultConfig(), port: 0, extensionToken: EXT_TOKEN };
+    const provider = new ExtensionProvider({ extensionToken: EXT_TOKEN, allowedOrigins: [], newChatUrl: config.newChatUrl, workerWaitMs: 600, bridgeVersion: 't', log: silentLogger });
+    const bridge = createBridgeServer(config, silentLogger, provider);
+    await bridge.listen();
+    try {
+      const ext = new FakeExtension();
+      await ext.connect(bridge.url());
+      ext.onJob = (j, send) => {
+        // Like the real extension: a working tab is announced busy and not ready, here for 1.5 s.
+        ext.send({ type: 'workers', workers: [{ id: 'w1', ready: false, busy: true }] });
+        setTimeout(() => {
+          send({ type: 'done', text: `reply to ${String(j.prompt)}`, conversationId: 'c1' });
+          ext.send({ type: 'workers', workers: [{ id: 'w1', ready: true, busy: false }] });
+        }, 1500);
+      };
+      ext.workers([{ id: 'w1' }]);
+      await wait(50);
+      const first = collect(provider.run(job({ prompt: 'one' }), new AbortController().signal));
+      await wait(50);
+      const second = await collect(provider.run(job({ prompt: 'two' }), new AbortController().signal));
+      assert.deepEqual(
+        (await first).filter((e) => e.type === 'done' || e.type === 'error').map((e) => e.type),
+        ['done'],
+      );
+      assert.equal(second.at(-1)?.type, 'done', JSON.stringify(second.at(-1)));
+      ext.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('fails a queued job when its only tab logs out while it waits', async () => {
+    const config: BridgeConfig = { ...defaultConfig(), port: 0, extensionToken: EXT_TOKEN };
+    const provider = new ExtensionProvider({ extensionToken: EXT_TOKEN, allowedOrigins: [], newChatUrl: config.newChatUrl, workerWaitMs: 600, bridgeVersion: 't', log: silentLogger });
+    const bridge = createBridgeServer(config, silentLogger, provider);
+    await bridge.listen();
+    try {
+      const ext = new FakeExtension();
+      await ext.connect(bridge.url());
+      ext.onJob = (j, send) => {
+        ext.send({ type: 'workers', workers: [{ id: 'w1', ready: false, busy: true }] });
+        setTimeout(() => {
+          send({ type: 'done', text: 'ok', conversationId: 'c1' });
+          // The page now shows a login screen: connected, but not ready.
+          ext.send({ type: 'workers', workers: [{ id: 'w1', ready: false, busy: false }] });
+        }, 300);
+      };
+      ext.workers([{ id: 'w1' }]);
+      await wait(50);
+      const first = collect(provider.run(job(), new AbortController().signal));
+      await wait(50);
+      const t0 = Date.now();
+      const second = await collect(provider.run(job(), new AbortController().signal));
+      assert.equal((await first).at(-1)?.type, 'done');
+      const err = second.at(-1) as { type: string; code: string; message: string };
+      assert.equal(err.code, 'no_worker');
+      assert.match(err.message, /none is ready/);
+      assert.ok(Date.now() - t0 < 3_000, 'fails about workerWaitMs after the tab stopped being usable');
+      ext.close();
+    } finally {
+      await bridge.close();
+    }
+  });
 });

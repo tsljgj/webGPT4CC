@@ -189,6 +189,63 @@ describe('fake chatgpt.com', { skip }, () => {
     assert.equal(await page.locator(CHIP).count(), 0);
   });
 
+  it('streams the SSE body over time in small slices, as the real site does', async () => {
+    const reply = `Streaming answer with emoji 😀 and CJK 中文.\n${'More text. '.repeat(30)}`;
+    // Record what the page's reader actually receives (the extension wraps the same reads).
+    const { fake, page } = await openFake({ llm: () => reply }, 'https://chatgpt.com/', () => {
+      const reads: Array<[number, number]> = [];
+      (window as unknown as { __reads: typeof reads }).__reads = reads;
+      const orig = ReadableStreamDefaultReader.prototype.read;
+      ReadableStreamDefaultReader.prototype.read = function (this: ReadableStreamDefaultReader<Uint8Array>) {
+        const p = orig.call(this);
+        p.then((r) => {
+          if (!r.done && r.value) reads.push([performance.now(), r.value.byteLength]);
+        }, () => {});
+        return p;
+      } as typeof orig;
+    });
+    await paste(page, 'stream please');
+    await send(page);
+    await waitIdle(page);
+    const [req] = await fake.waitForRequests(1);
+    if (req!.delivery !== 'stream') {
+      // No openssl here: bodies are delivered whole, nothing more to check.
+      assert.equal(req!.delivery, 'whole');
+      return;
+    }
+    const reads = await page.evaluate(() => (window as unknown as { __reads: Array<[number, number]> }).__reads);
+    assert.ok(reads.length >= 5, `the page read the body in ${reads.length} chunk(s)`);
+    assert.ok(reads.at(-1)![0] - reads[0]![0] >= 50, 'the chunks arrived over time');
+    assert.ok((req!.slices ?? 0) >= 5);
+    // The page still assembles the exact reply and reports a complete turn.
+    assert.equal(await page.locator('[role="status"]').textContent(), 'Response complete');
+    assert.equal(reduceSse(req!.responseBody!).answer, reply);
+  });
+
+  it('drops the connection mid-answer when asked; the conversation API still has the full answer', async () => {
+    const reply = `Partial on the wire, complete on the server.\n${'Line of text.\n'.repeat(20)}`;
+    const { fake, page } = await openFake({ llm: () => ({ text: reply, cutStream: 'mid-answer' }) });
+    await paste(page, 'cut me off');
+    await send(page);
+    await waitIdle(page);
+    const [req] = await fake.waitForRequests(1);
+    assert.equal(req!.cut, true);
+    // The page saw a broken stream: an error in the turn, no completion announcement.
+    await page.waitForSelector('[role="alert"]');
+    assert.notEqual(await page.locator('[role="status"]').textContent(), 'Response complete');
+    const partial = reduceSse(req!.responseBody!);
+    assert.equal(partial.complete, false);
+    assert.ok(partial.answer.length > 0 && partial.answer.length < reply.length, `cut mid-answer (${partial.answer.length} of ${reply.length} chars)`);
+    // GET /backend-api/conversation/{id} returns the whole, finished answer.
+    const conv = await page.evaluate(
+      async ({ id, token }) => (await fetch(`/backend-api/conversation/${id}`, { headers: { authorization: `Bearer ${token}` } })).json(),
+      { id: req!.responseConversationId!, token: fake.accessToken },
+    );
+    const node = (conv as { mapping: Record<string, { message: { content: { parts?: string[] }; status: string } }> }).mapping[req!.assistantMessageId!]!;
+    assert.equal(node.message.content.parts?.join(''), reply);
+    assert.equal(node.message.status, 'finished_successfully');
+  });
+
   it('continues a conversation in the same tab with conversation_id and parent_message_id', async () => {
     const seen: Array<{ prompt: string; history: number; turn: number }> = [];
     const { fake, page } = await openFake({

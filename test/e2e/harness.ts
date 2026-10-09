@@ -20,7 +20,7 @@
 //
 // Environment knobs: E2E_VERBOSE=1 (stream bridge/browser/fake logs to stderr),
 // E2E_HEADED=1, E2E_EXTENSION_DIR=/path/to/unpacked/extension, CLAUDE_BIN=/path/to/claude.
-import { spawn, spawnSync } from 'node:child_process';
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -300,8 +300,24 @@ export interface ClaudeRun {
  * launch.ts. --dangerously-skip-permissions is refused as root, so tools are
  * pre-approved with --allowedTools + acceptEdits instead.
  */
-export async function runClaude(opts: { config: BridgeConfig; prompt: string; cwd: string; timeoutMs?: number; args?: string[] }): Promise<ClaudeRun> {
-  const home = tempDir('home');
+/** `claude` processes still running (killed by killClaudeRuns, e.g. when a test timed out). */
+const liveClaudeRuns = new Set<ChildProcess>();
+
+export function killClaudeRuns(): void {
+  for (const child of liveClaudeRuns) child.kill('SIGKILL');
+  liveClaudeRuns.clear();
+}
+
+export async function runClaude(opts: {
+  config: BridgeConfig;
+  prompt: string;
+  cwd: string;
+  timeoutMs?: number;
+  args?: string[];
+  /** Reuse this HOME (and its Claude Code sessions, e.g. for --continue); the caller removes it. */
+  home?: string;
+}): Promise<ClaudeRun> {
+  const home = opts.home ?? tempDir('home');
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
     HOME: home,
@@ -311,6 +327,7 @@ export async function runClaude(opts: { config: BridgeConfig; prompt: string; cw
   const args = ['-p', opts.prompt, '--allowedTools', 'Bash Write Read Edit', '--permission-mode', 'acceptEdits', '--output-format', 'json', ...(opts.args ?? [])];
   const t0 = Date.now();
   const child = spawn(CLAUDE_BIN, args, { cwd: opts.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  liveClaudeRuns.add(child);
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => (stdout += d));
@@ -320,9 +337,13 @@ export async function runClaude(opts: { config: BridgeConfig; prompt: string; cw
     timedOut = true;
     child.kill('SIGKILL');
   }, opts.timeoutMs ?? 240_000);
-  const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((res) => child.on('close', (c, s) => res([c, s])));
+  const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((res) => {
+    child.on('close', (c, s) => res([c, s]));
+    child.on('error', () => res([null, null])); // could not start (close may not follow)
+  });
   clearTimeout(timer);
-  rmSync(home, { recursive: true, force: true });
+  liveClaudeRuns.delete(child);
+  if (!opts.home) rmSync(home, { recursive: true, force: true });
   let json: Record<string, unknown> | undefined;
   for (const line of stdout.trim().split('\n').reverse()) {
     try {
@@ -356,7 +377,7 @@ export interface Chain {
 export async function startChain(opts: { fake?: Partial<FakeOptions>; bridge?: Partial<BridgeConfig>; extensionDir?: string } = {}): Promise<Chain> {
   const fakeLogs = new LogBuffer('fake');
   const fake = new FakeChatGPT({ log: (l) => fakeLogs.push(l), ...opts.fake });
-  // Cleanups run in reverse order: the browser first, the fake's stream server last.
+  // Cleanups run in reverse order: claude runs, the browser, then the bridge, the fake's stream server last.
   const cleanups: Array<() => Promise<void>> = [() => fake.close()];
   const closeAll = async () => {
     for (const fn of cleanups.reverse()) await fn().catch(() => {});
@@ -378,6 +399,7 @@ export async function startChain(opts: { fake?: Partial<FakeOptions>; bridge?: P
     cleanups.push(() => bridge!.close());
     browser = await launchChromium({ extensionDir: opts.extensionDir ?? EXTENSION_DIR });
     cleanups.push(() => browser!.close());
+    cleanups.push(async () => killClaudeRuns());
     await fake.install(browser.context);
     const sw = await extensionWorker(browser.context);
     await configureExtension(sw, { bridgeUrl: bridge.url, token: bridge.config.extensionToken });

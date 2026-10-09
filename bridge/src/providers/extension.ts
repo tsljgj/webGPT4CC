@@ -214,9 +214,15 @@ export class ExtensionProvider implements ChatProvider {
     return n;
   }
 
-  private readyWorkerCount(): number {
+  /**
+   * Workers that can take a job now or later without the user's help: ready, or
+   * busy with a job (we queue behind it; the extension reports a busy tab as not
+   * ready). A logged-out or broken tab is neither.
+   */
+  private usableWorkerCount(): number {
     let n = 0;
-    for (const c of this.conns.values()) for (const w of c.workers.values()) if (w.ready) n++;
+    for (const c of this.conns.values())
+      for (const w of c.workers.values()) if (w.ready || w.busy || this.busy.has(`${c.id}:${w.id}`)) n++;
     return n;
   }
 
@@ -328,9 +334,17 @@ export class ExtensionProvider implements ChatProvider {
       };
       const onAbort = () => cleanup(() => (remove(), reject(new Error('aborted'))));
       signal.addEventListener('abort', onAbort, { once: true });
-      // Fail if no usable worker shows up within workerWaitMs (busy workers are fine: we queue).
+      // Fail once no usable worker has been seen for workerWaitMs (re-checked until the
+      // job is dispatched, so a tab that logs out while jobs queue is noticed too).
+      let lastUsable = Date.now();
       const checkNoWorker = () => {
-        if (this.readyWorkerCount() > 0 || !this.waiters.includes(waiter)) return;
+        if (!this.waiters.includes(waiter)) return;
+        if (this.usableWorkerCount() > 0) lastUsable = Date.now();
+        const left = lastUsable + this.opts.workerWaitMs - Date.now();
+        if (left > 0) {
+          noWorkerTimer = setTimeout(checkNoWorker, Math.min(left, 1_000));
+          return;
+        }
         const total = this.workerCount();
         cleanup(() => {
           remove();
@@ -343,7 +357,7 @@ export class ExtensionProvider implements ChatProvider {
           );
         });
       };
-      noWorkerTimer = setTimeout(checkNoWorker, this.opts.workerWaitMs);
+      noWorkerTimer = setTimeout(checkNoWorker, Math.min(this.opts.workerWaitMs, 1_000));
       // Re-run dispatch periodically so affinity waits can expire.
       affinityTimer = setInterval(() => this.dispatch(), 2_000);
       this.waiters.push(waiter);
