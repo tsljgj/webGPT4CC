@@ -25,17 +25,26 @@ function bridgeEnv(): Record<string, string> {
     ANTHROPIC_DEFAULT_SONNET_MODEL: model,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
     CLAUDE_CODE_SUBAGENT_MODEL: model,
-    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(cfg.claudeContextWindow ?? 128000),
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(cfg.claudeContextWindow ?? 120000),
     // ChatGPT can think for minutes: relax timeouts and the stream watchdog.
     API_TIMEOUT_MS: '3600000',
     CLAUDE_ENABLE_STREAM_WATCHDOG: '0',
     CLAUDE_STREAM_IDLE_TIMEOUT_MS: '1800000',
+    CLAUDE_CODE_MAX_RETRIES: '3',
+    CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1',
+    CLAUDE_CODE_GATEWAY_HINT_HEADERS: '1',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
+    CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
+    // A cloud provider enabled in ~/.claude/settings.json would bypass the bridge.
+    CLAUDE_CODE_USE_BEDROCK: '',
+    CLAUDE_CODE_USE_VERTEX: '',
+    CLAUDE_CODE_USE_FOUNDRY: '',
   };
 }
 
-const env: Record<string, string | undefined> = { ...process.env, ...bridgeEnv() };
+const layer = bridgeEnv();
+const env: Record<string, string | undefined> = { ...process.env, ...layer };
 // Make sure nothing routes the child to Anthropic instead of the bridge.
 for (const k of ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDECODE']) delete env[k];
 
@@ -51,6 +60,8 @@ for await (const message of query({
     permissionMode: 'default',
     allowedTools: ['Read', 'Glob', 'Grep', 'Bash(ls:*)'],
     maxTurns: 10,
+    // Settings layer: beats an `env` block in ~/.claude/settings.json that points elsewhere.
+    settings: { env: layer, disableAutoMode: 'disable' } as never,
   },
 })) {
   if (message.type === 'assistant') {

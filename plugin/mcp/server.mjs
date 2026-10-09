@@ -28,8 +28,18 @@ export function loadBridgeSettings(env = process.env) {
   } catch {
     /* no config yet: defaults below */
   }
-  const host = !file.host || file.host === '0.0.0.0' || file.host === '::' ? '127.0.0.1' : file.host;
-  const port = file.port ?? 8765;
+  // A running `webgpt4cc serve` records its actual address (it may use --port/--host).
+  let runtime = null;
+  try {
+    const r = JSON.parse(readFileSync(join(dir, 'runtime.json'), 'utf8'));
+    process.kill(r.pid, 0);
+    runtime = r;
+  } catch {
+    /* no running bridge recorded */
+  }
+  const rawHost = env.WEBGPT4CC_HOST || runtime?.host || file.host;
+  const host = !rawHost || rawHost === '0.0.0.0' || rawHost === '::' ? '127.0.0.1' : rawHost;
+  const port = Number(env.WEBGPT4CC_PORT) || runtime?.port || file.port || 8765;
   return {
     configPath: path,
     url: (env.WEBGPT4CC_BRIDGE_URL || `http://${host.includes(':') ? `[${host}]` : host}:${port}`).replace(/\/+$/, ''),
@@ -450,6 +460,11 @@ async function delegateTool(args, settings, ctx) {
     const kill = (reason) => {
       if (child.exitCode !== null || killedReason) return;
       killedReason = reason;
+      if (process.platform === 'win32') {
+        // With cmd.exe in between, killing the child would leave claude running: end the tree.
+        spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }).on('error', () => child.kill());
+        return;
+      }
       child.kill('SIGTERM');
       setTimeout(() => child.exitCode === null && child.kill('SIGKILL'), 5000).unref();
     };

@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { type BridgeConfig, configPath, loadConfig } from './config.ts';
+import { type BridgeConfig, configPath, loadConfig, readRuntime, runtimePath, writeRuntime } from './config.ts';
 import { bridgeUrl, childEnv, claudeArgs, claudeEnv, formatEnv, withBareAuth } from './launch.ts';
 import { createLogger } from './log.ts';
 import { MockProvider } from './providers/mock.ts';
@@ -76,7 +76,7 @@ function overridesFrom(flags: Record<string, string | boolean>): Partial<BridgeC
 }
 
 async function serve(flags: Record<string, string | boolean>): Promise<void> {
-  const config = loadConfig({ overrides: overridesFrom(flags) });
+  const config = loadConfig({ overrides: overridesFrom(flags), runtime: false });
   const log = createLogger(config.logLevel, config.dumpDir);
   const provider =
     config.provider === 'mock' && typeof flags['mock-script'] === 'string'
@@ -85,15 +85,26 @@ async function serve(flags: Record<string, string | boolean>): Promise<void> {
   const bridge = createBridgeServer(config, log, provider);
   const { host, port } = await bridge.listen();
   const url = bridgeUrl({ host, port });
+  // Lets gptcc, env, pair, doctor and the plugin find this bridge even with --port/--host.
+  try {
+    writeRuntime(host, port);
+  } catch {
+    /* best effort */
+  }
   log.info(`webGPT4CC bridge ${VERSION} listening on ${url} (provider: ${provider.name})`);
   if (config.provider === 'extension') {
     // Printed directly (not through the logger) so the token never lands in a --dump-dir log file.
     process.stderr.write(`extension pairing: bridge URL ${url}  token ${config.extensionToken || '(none)'}\n`);
     log.info('waiting for the browser extension... (open chatgpt.com in Chrome with the webGPT4CC extension)');
   }
-  log.info(`run Claude Code with: gptcc   (or: eval "$(webgpt4cc env)" && claude)`);
+  log.info('run Claude Code with: gptcc   (or: eval "$(webgpt4cc env)" && claude --permission-mode default)');
   const stop = async () => {
     log.info('shutting down');
+    try {
+      if (readRuntime()?.port === port) rmSync(runtimePath(), { force: true });
+    } catch {
+      /* ignore */
+    }
     await bridge.close();
     process.exit(0);
   };

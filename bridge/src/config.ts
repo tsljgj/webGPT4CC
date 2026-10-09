@@ -172,11 +172,37 @@ function envOverrides(env: NodeJS.ProcessEnv): Partial<BridgeConfig> {
   return o;
 }
 
-export function loadConfig(opts: { file?: boolean; overrides?: Partial<BridgeConfig>; env?: NodeJS.ProcessEnv } = {}): BridgeConfig {
+export function runtimePath(): string {
+  return join(configDir(), 'runtime.json');
+}
+
+/** Address of a running `webgpt4cc serve` (it may have been started with --port/--host). */
+export function readRuntime(path = runtimePath()): { host: string; port: number } | null {
+  try {
+    const r = JSON.parse(readFileSync(path, 'utf8')) as { host?: string; port?: number; pid?: number };
+    if (typeof r.port !== 'number' || typeof r.host !== 'string' || typeof r.pid !== 'number') return null;
+    process.kill(r.pid, 0); // throws if that bridge is gone
+    return { host: r.host, port: r.port };
+  } catch {
+    return null;
+  }
+}
+
+export function writeRuntime(host: string, port: number, path = runtimePath()): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ host, port, pid: process.pid }) + '\n', { mode: 0o600 });
+}
+
+export function loadConfig(
+  opts: { file?: boolean; overrides?: Partial<BridgeConfig>; env?: NodeJS.ProcessEnv; runtime?: boolean } = {},
+): BridgeConfig {
   let cfg = defaultConfig();
   if (opts.file !== false) {
     cfg.sessionFile = join(configDir(), 'sessions.json');
     cfg = deepMerge(cfg, ensureConfigFile());
+    // Clients (gptcc, env, pair, doctor) follow a running bridge's actual address.
+    const rt = opts.runtime === false ? null : readRuntime();
+    if (rt) cfg = { ...cfg, host: rt.host, port: rt.port };
   }
   cfg = deepMerge(cfg, envOverrides(opts.env ?? process.env));
   if (opts.overrides) cfg = deepMerge(cfg, opts.overrides);
