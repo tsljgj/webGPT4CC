@@ -83,6 +83,7 @@ export function childEnv(settings, model, base = process.env) {
     CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: '3600000',
     CLAUDE_CODE_MAX_CONTEXT_TOKENS: settings.contextWindow ?? '128000',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     DISABLE_PROMPT_CACHING: '1',
   });
   return env;

@@ -296,6 +296,18 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     }
     return;
   }
+  if (kind === 'classifier') {
+    // Never approve actions on the classifier's behalf: refuse, and Claude Code blocks the action.
+    sendBridgeError(
+      res,
+      new BridgeError(
+        'invalid_request_error',
+        'Claude Code auto mode is not supported through webGPT4CC (its safety classifier would cost two large ChatGPT messages per tool call). Restart with --permission-mode default or acceptEdits (gptcc does this for you).',
+        false,
+      ),
+    );
+    return;
+  }
   if (kind === 'web_search' && config.webSearch === 'disabled') {
     sendBridgeError(res, new BridgeError('invalid_request_error', 'web search is disabled in the webGPT4CC bridge config', false));
     return;

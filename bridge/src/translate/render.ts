@@ -206,15 +206,24 @@ function renderToolResult(b: ToolResultBlock, ctx: RenderCtx): string {
   return `<tool_result ${attrs.join(' ')}>\n${body}\n</tool_result>`;
 }
 
+/** Harness noise that means nothing to a ChatGPT model (Claude's own token budget). */
+const NOISE_RE = /<total_tokens>[^<]*<\/total_tokens>\s*/g;
+
+function stripNoise(s: string): string {
+  return s.includes('<total_tokens>') ? s.replace(NOISE_RE, '') : s;
+}
+
 /** Render the content of one message (user, system or assistant) without a wrapper. */
 export function renderMessageBody(m: MessageParam | { role: string; content: MessageParam['content'] }, ctx: RenderCtx): string {
-  if (typeof m.content === 'string') return m.content;
+  if (typeof m.content === 'string') return stripNoise(m.content);
   const out: string[] = [];
   for (const b of m.content) {
     switch (b.type) {
-      case 'text':
-        if ((b as TextBlock).text.trim()) out.push((b as TextBlock).text);
+      case 'text': {
+        const t = stripNoise((b as TextBlock).text);
+        if (t.trim()) out.push(t);
         break;
+      }
       case 'tool_use':
         out.push(renderToolCall((b as ToolUseBlock).name, (b as ToolUseBlock).input));
         break;
@@ -237,7 +246,7 @@ function wrap(role: string, body: string): string {
 /** Messages that come from the harness rather than a person ("system" role inside messages[]). */
 function renderLatestBody(m: MessageParam | { role: string; content: MessageParam['content'] }, ctx: RenderCtx): string {
   const body = renderMessageBody(m, ctx);
-  if ((m.role as string) === 'system') return `<harness_message>\n${body}\n</harness_message>`;
+  if ((m.role as string) === 'system') return body.trim() ? `<harness_message>\n${body}\n</harness_message>` : '';
   return body;
 }
 
@@ -247,7 +256,13 @@ export function lastAssistantIndex(messages: MessageParam[]): number {
   return -1;
 }
 
+function isTextOnlyRequest(req: MessagesRequest): boolean {
+  const last = req.messages[req.messages.length - 1];
+  return !!last && last.role === 'user' && /CRITICAL: Respond with TEXT ONLY\. Do NOT call any tools/.test(textOf(last.content));
+}
+
 function toolChoiceNote(req: MessagesRequest): string {
+  if (isTextOnlyRequest(req)) return '\n\n[For this reply do NOT call any tools; answer in plain text only.]';
   const tc = req.tool_choice;
   if (!tc || !req.tools?.length) return '';
   if (tc.type === 'tool' && tc.name) return `\n\n[For this reply you MUST call the tool "${tc.name}" (exactly one call).]`;
@@ -326,7 +341,7 @@ export function renderDeltaPrompt(req: MessagesRequest, fromIndex: number, opts:
     .filter((s) => s.trim());
   let text = parts.join('\n\n') || '(continue)';
   text += toolChoiceNote(req);
-  if (opts.reminderFooter && visibleTools(req.tools, opts).length) text += `\n\n${REMINDER_FOOTER}`;
+  if (opts.reminderFooter && visibleTools(req.tools, opts).length && !isTextOnlyRequest(req)) text += `\n\n${REMINDER_FOOTER}`;
   return { text, covered: req.messages.length };
 }
 

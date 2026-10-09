@@ -55,9 +55,23 @@ export function claudeEnv(config: BridgeConfig, model?: string): Record<string, 
     // "chatgpt-web" is unknown to Claude Code; tell it the window to compact against.
     CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(config.claudeContextWindow),
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    // Smaller requests (no safeguards/context_management fields); nothing the bridge needs.
+    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     DISABLE_PROMPT_CACHING: '1',
   };
   return env;
+}
+
+const PERMISSION_FLAGS = ['--permission-mode', '--dangerously-skip-permissions', '--allow-dangerously-skip-permissions'];
+
+/**
+ * Claude Code defaults to "auto" permission mode, whose safety classifier makes two
+ * very large extra model calls per tool use. That does not work through ChatGPT, so
+ * unless the user chose a mode, start in "default" (ask before acting).
+ */
+export function claudeArgs(args: string[]): string[] {
+  const chosen = args.some((a) => PERMISSION_FLAGS.some((f) => a === f || a.startsWith(`${f}=`)));
+  return chosen ? args : ['--permission-mode', 'default', ...args];
 }
 
 export function childEnv(base: NodeJS.ProcessEnv, overrides: Record<string, string>): NodeJS.ProcessEnv {

@@ -11,7 +11,18 @@ import { systemText, textOf } from './translate/render.ts';
  *               -> one-off ChatGPT chat that is allowed to browse
  * - probe:      max_tokens=1 quota/connectivity probes -> answered locally
  */
-export type RequestKind = 'main' | 'background' | 'web_search' | 'probe';
+export type RequestKind = 'main' | 'background' | 'web_search' | 'probe' | 'classifier';
+
+/** Claude Code's auto-mode safety classifier (two extra ~140 KB requests per tool call). */
+export function isSafetyClassifierRequest(req: MessagesRequest): boolean {
+  return /You are a security monitor for autonomous AI coding agents/.test(systemText(req.system).slice(0, 2000));
+}
+
+/** Claude Code's conversation-compaction request: same tools, but the model must answer in text. */
+export function isCompactionRequest(req: MessagesRequest): boolean {
+  const last = req.messages[req.messages.length - 1];
+  return !!last && last.role === 'user' && /CRITICAL: Respond with TEXT ONLY\. Do NOT call any tools/.test(textOf(last.content));
+}
 
 export function isWebSearchRequest(req: MessagesRequest): boolean {
   return (req.tools ?? []).some((t) => typeof t.type === 'string' && /^web_search/.test(t.type));
@@ -19,6 +30,7 @@ export function isWebSearchRequest(req: MessagesRequest): boolean {
 
 export function classifyRequest(req: MessagesRequest, backgroundModel: boolean, _config: BridgeConfig): RequestKind {
   if ((req.max_tokens ?? 0) === 1) return 'probe';
+  if (isSafetyClassifierRequest(req)) return 'classifier';
   if (isWebSearchRequest(req)) return 'web_search';
   const clientTools = (req.tools ?? []).filter((t) => t.input_schema && !t.type);
   if (clientTools.length === 0 || req.tool_choice?.type === 'none') return 'background';

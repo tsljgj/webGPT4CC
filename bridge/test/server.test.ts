@@ -330,3 +330,70 @@ describe('client disconnects', () => {
     }
   });
 });
+
+describe('Claude Code side requests', () => {
+  it('refuses auto-mode safety classifier requests without asking ChatGPT', async () => {
+    const ctx = await start(() => 'should not be used');
+    try {
+      const r = await post(ctx.url, '/v1/messages', {
+        model: 'claude-sonnet-5',
+        max_tokens: 64,
+        system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_version=1;' }, { type: 'text', text: 'You are a security monitor for autonomous AI coding agents.\n...' }],
+        messages: [{ role: 'user', content: '<transcript>...</transcript>' }],
+      });
+      assert.equal(r.status, 400);
+      assert.equal(r.headers.get('x-should-retry'), 'false');
+      assert.equal(ctx.mock.jobs.length, 0);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+
+  it('asks for a text-only answer on compaction requests', async () => {
+    const replies = ['<tool_call name="Bash">\n<param name="command">ls</param>\n</tool_call>', '<summary>all good</summary>'];
+    const ctx = await start(() => replies.shift()!);
+    try {
+      const first = { model: 'm', max_tokens: 100, stream: true, tools: TOOLS, messages: [{ role: 'user', content: 'list' }] };
+      const r1 = assemble(parseSse(await (await post(ctx.url, '/v1/messages', first)).text()));
+      const tu = r1.content.find((b) => b.type === 'tool_use')!;
+      const compact = {
+        ...first,
+        messages: [
+          ...first.messages,
+          { role: 'assistant', content: r1.content },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: tu.id, content: 'a.txt' },
+              { type: 'text', text: 'CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary...' },
+            ],
+          },
+        ],
+      };
+      await (await post(ctx.url, '/v1/messages', compact)).text();
+      const job = ctx.mock.jobs[1]!;
+      assert.match(job.prompt, /do NOT call any tools; answer in plain text only/);
+      assert.doesNotMatch(job.prompt, /bridge reminder/);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+
+  it('drops <total_tokens> noise from harness messages', async () => {
+    const ctx = await start(() => 'ok');
+    try {
+      await post(ctx.url, '/v1/messages', {
+        model: 'm',
+        max_tokens: 100,
+        tools: TOOLS,
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'system', content: '<total_tokens>14999951 tokens left</total_tokens>' },
+        ],
+      });
+      assert.doesNotMatch(ctx.mock.jobs[0]!.prompt, /total_tokens|harness_message/);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+});
