@@ -142,9 +142,9 @@ export function createBridgeServer(config: BridgeConfig, log: Logger, provider: 
       return;
     }
     if (req.method === 'GET' && path === '/v1/models') {
-      const ids = [...new Set([config.models.default, config.models.background, ...Object.values(config.models.map)].filter(Boolean))];
+      const ids = [...new Set(['chatgpt-web', config.models.default, config.models.background, ...Object.values(config.models.map)].filter(Boolean))];
       sendJson(res, 200, {
-        data: ids.map((id) => ({ type: 'model', id, display_name: `ChatGPT ${id}`, created_at: '2026-01-01T00:00:00Z' })),
+        data: ids.map((id) => ({ type: 'model', id, display_name: id === 'chatgpt-web' ? 'ChatGPT (model selected in the tab)' : `ChatGPT ${id}`, created_at: '2026-01-01T00:00:00Z' })),
         has_more: false,
         first_id: ids[0] ?? null,
         last_id: ids[ids.length - 1] ?? null,

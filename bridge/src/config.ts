@@ -6,9 +6,13 @@ import { dirname, join } from 'node:path';
 import { DEFAULT_RENDER_OPTIONS, type RenderOptions } from './translate/render.ts';
 
 export interface ModelConfig {
-  /** ChatGPT model slug used for the main agent loop when the requested model is a Claude name. */
+  /**
+   * ChatGPT model slug for the main agent loop when the requested model is a
+   * Claude name or "chatgpt-web". Empty = whatever model is selected in the
+   * ChatGPT tab (most reliable: ChatGPT's model URL parameter is not guaranteed).
+   */
   default: string;
-  /** Slug for Claude Code's small/fast ("haiku") requests. */
+  /** Slug for Claude Code's small/fast ("haiku") requests. Empty = the tab's model. */
   background: string;
   /** Exact overrides: requested model name -> ChatGPT slug. */
   map: Record<string, string>;
@@ -60,8 +64,8 @@ export function defaultConfig(): BridgeConfig {
     allowedOrigins: [],
     provider: 'extension',
     models: {
-      default: 'gpt-5-thinking',
-      background: 'gpt-5-instant',
+      default: '',
+      background: '',
       map: {},
     },
     newChatUrl: 'https://chatgpt.com/?model={model}',
@@ -163,13 +167,22 @@ export function validateConfig(cfg: BridgeConfig): void {
   if (!cfg.newChatUrl.startsWith('https://')) throw new Error(`newChatUrl must be an https URL: ${cfg.newChatUrl}`);
 }
 
-/** Resolve the ChatGPT model slug for a model name requested by Claude Code. */
+/** Model name Claude Code is given when the bridge picks the model (see resolveChatModel). */
+export const DEFAULT_CLAUDE_MODEL_NAME = 'chatgpt-web';
+
+/**
+ * Resolve the ChatGPT model slug for a model name requested by Claude Code:
+ * exact `models.map` entry > "chatgpt/<slug>" > OpenAI-looking names (gpt-*, o3, auto)
+ * > haiku names -> models.background > everything else -> models.default.
+ * An empty slug means "use the model selected in the ChatGPT tab".
+ */
 export function resolveChatModel(requested: string, models: ModelConfig): { slug: string; background: boolean } {
   const name = (requested ?? '').trim();
   if (models.map[name] !== undefined) return { slug: models.map[name]!, background: /haiku/i.test(name) };
+  if (/^chatgpt[-_ ]?web$/i.test(name) || /^chatgpt$/i.test(name)) return { slug: models.default, background: false };
   if (/^chatgpt[/:]/i.test(name)) return { slug: name.replace(/^chatgpt[/:]/i, ''), background: false };
-  if (/^(gpt-|o\d|chatgpt-)/i.test(name)) return { slug: name, background: false };
-  if (/haiku/i.test(name)) return { slug: models.background, background: true };
+  if (/^(gpt-|o\d|auto$)/i.test(name)) return { slug: name, background: false };
+  if (/haiku/i.test(name)) return { slug: models.background || models.default, background: true };
   return { slug: models.default, background: false };
 }
 

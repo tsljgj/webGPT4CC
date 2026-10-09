@@ -70,6 +70,8 @@ export class BridgeError extends Error {
   readonly type: ErrorType;
   readonly retryable: boolean;
   readonly retryAfterMs?: number;
+  /** Provider error code this error was mapped from, if any. */
+  providerCode?: ProviderErrorCode;
   constructor(type: ErrorType, message: string, retryable: boolean, retryAfterMs?: number) {
     super(message);
     this.type = type;
@@ -79,6 +81,12 @@ export class BridgeError extends Error {
 }
 
 function providerErrorToBridge(code: ProviderErrorCode, message: string, retryAfterMs?: number): BridgeError {
+  const err = mapProviderError(code, message, retryAfterMs);
+  err.providerCode = code;
+  return err;
+}
+
+function mapProviderError(code: ProviderErrorCode, message: string, retryAfterMs?: number): BridgeError {
   switch (code) {
     case 'no_worker':
       return new BridgeError(
@@ -313,7 +321,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   }
 
   // 3. Plan the ChatGPT turn (continue an existing conversation or start a new one).
-  const plan = planTurn(state, req, kind, chatModel);
+  let plan = planTurn(state, req, kind, chatModel);
   if (plan.conversation.kind === 'continue') state.stats.continued++;
   else if (lastAssistantIndex(req.messages) >= 0 && kind === 'main') state.stats.replayed++;
 
@@ -358,7 +366,20 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   state.cache.set(rHash, donePromise);
 
   try {
-    const result = await runJob(state, plan, abort.signal, onProgress);
+    let result: Awaited<ReturnType<typeof runJob>>;
+    try {
+      result = await runJob(state, plan, abort.signal, onProgress);
+    } catch (e) {
+      // The ChatGPT conversation is gone (deleted, or a temporary chat whose tab moved on):
+      // replay the transcript into a new conversation once.
+      if (!(e instanceof BridgeError) || e.providerCode !== 'conversation_not_found' || plan.conversation.kind !== 'continue' || emitted || abort.signal.aborted)
+        throw e;
+      log.warn(`${e.message}; replaying the transcript into a new ChatGPT conversation`);
+      state.sessions.dropConversation(plan.conversation.conversationId);
+      plan = { ...plan, conversation: { kind: 'new' }, prompt: renderFullPrompt(kind === 'main' ? req : { ...req, tools: [] }, config.render).text, fromTurn: undefined };
+      state.stats.replayed++;
+      result = await runJob(state, plan, abort.signal, onProgress);
+    }
     state.stats.chatgptTurns++;
     const parsed = parseReply(result.text, plan.tools);
     for (const w of parsed.warnings) log.warn(`parser: ${w}`);

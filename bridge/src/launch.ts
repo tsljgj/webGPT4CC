@@ -1,5 +1,5 @@
 // Environment for running the `claude` CLI against the bridge.
-import type { BridgeConfig } from './config.ts';
+import { type BridgeConfig, DEFAULT_CLAUDE_MODEL_NAME } from './config.ts';
 
 /** Variables that would make a child `claude` talk to Anthropic (or think it is nested) instead of the bridge. */
 export const STRIPPED_ENV = [
@@ -34,15 +34,16 @@ export function bridgeUrl(config: Pick<BridgeConfig, 'host' | 'port'>): string {
 
 /** Env overrides that point Claude Code at the bridge. */
 export function claudeEnv(config: BridgeConfig, model?: string): Record<string, string> {
-  const main = model || config.models.default;
+  const main = model || config.models.default || DEFAULT_CLAUDE_MODEL_NAME;
+  const small = config.models.background || main;
   const env: Record<string, string> = {
     ANTHROPIC_BASE_URL: bridgeUrl(config),
     ANTHROPIC_AUTH_TOKEN: config.authToken || 'webgpt4cc',
     ANTHROPIC_MODEL: main,
     ANTHROPIC_DEFAULT_OPUS_MODEL: main,
     ANTHROPIC_DEFAULT_SONNET_MODEL: main,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: config.models.background || main,
-    ANTHROPIC_SMALL_FAST_MODEL: config.models.background || main,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: small,
+    ANTHROPIC_SMALL_FAST_MODEL: small,
     CLAUDE_CODE_SUBAGENT_MODEL: main,
     // ChatGPT replies (especially thinking models) can take many minutes.
     API_TIMEOUT_MS: '3600000',
