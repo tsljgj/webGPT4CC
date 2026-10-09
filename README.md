@@ -107,9 +107,10 @@ two very large extra model calls per tool use. To use another client, run
 ```
 
 Then ask Claude to "delegate this to GPT", or use `/gpt-web:delegate <task>`,
-`/gpt-web:ask <question>` or `/gpt-web:status`. The delegate gets read, search and edit
-tools by default. Claude can grant `Bash(...)` rules per task, and pass `lite: true` for a
-smaller, faster delegate. A delegate cannot delegate again.
+`/gpt-web:ask <question>` or `/gpt-web:status`. By default the delegate can read and search,
+and edit files inside the project (it runs headless in `acceptEdits` mode, so anything else is
+denied). Claude can grant `Bash(...)` rules per task, and pass `lite: true` for a smaller,
+faster delegate. A delegate cannot delegate again.
 
 **From your own code (Claude Agent SDK):** see [examples/agent-sdk.ts](examples/agent-sdk.ts).
 

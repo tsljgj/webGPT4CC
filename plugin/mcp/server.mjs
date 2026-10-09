@@ -7,9 +7,9 @@
 // (`claude -p --output-format stream-json`), i.e. the same interface the Claude
 // Agent SDK drives, with ANTHROPIC_BASE_URL pointing at the bridge.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
 const SERVER_INFO = { name: 'webgpt4cc', version: '0.1.0' };
@@ -66,6 +66,14 @@ const STRIPPED_ENV = [
   'CLAUDE_CODE_GZIP_REQUEST_BODIES',
 ];
 
+function realOrSelf(p) {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
 /** Env that points a child `claude` at the bridge (kept in sync with bridge/src/launch.ts). */
 export function bridgeEnv(settings, model) {
   return {
@@ -121,7 +129,9 @@ export function recursionProblem(env, settings) {
 // ---------------------------------------------------------------------------
 // Tools
 
-const DEFAULT_ALLOWED_TOOLS = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'NotebookEdit', 'TodoWrite'];
+// Edits are NOT listed: --permission-mode acceptEdits already allows Edit/Write inside the working
+// directory, while an explicit "Write"/"Edit" rule would allow writing anywhere on disk.
+const DEFAULT_ALLOWED_TOOLS = ['Read', 'Glob', 'Grep', 'TodoWrite'];
 
 export const TOOLS = [
   {
@@ -130,7 +140,7 @@ export const TOOLS = [
       'Run a task with a separate Claude Code agent that is powered by the user\'s ChatGPT web subscription (via the local webGPT4CC bridge) instead of Claude. ' +
       'Use it to offload self-contained work (bulk edits, writing tests, refactors, investigations) and save Claude usage. ' +
       'The delegate starts with NO knowledge of this conversation: write a complete, self-contained brief (goal, relevant files, constraints, how to verify). ' +
-      'It works in `cwd` (default: the current project) and can only use `allowed_tools` (default: read/search/edit tools, no Bash). ' +
+      'It works in `cwd` (default: the current project; must be inside it), may edit files inside that directory, and can additionally use `allowed_tools` (default: read/search tools; no Bash). ' +
       'Each of its steps costs one ChatGPT message. Returns the delegate\'s final report plus a summary of the tools it used and files it changed; ' +
       'pass `resume_session_id` to continue the same delegate session with a follow-up instruction.',
     inputSchema: {
@@ -141,7 +151,7 @@ export const TOOLS = [
         allowed_tools: {
           type: 'array',
           items: { type: 'string' },
-          description: `Claude Code tool rules the delegate may use without asking, e.g. ["Read","Edit","Bash(npm test:*)"]. Default: ${DEFAULT_ALLOWED_TOOLS.join(', ')}.`,
+          description: `Extra Claude Code tool rules the delegate may use without asking, e.g. ["Bash(npm test:*)", "Bash(git diff:*)"]. Default: ${DEFAULT_ALLOWED_TOOLS.join(', ')}. File edits inside cwd are always allowed; do not add bare "Write"/"Edit" (that would allow writing anywhere).`,
         },
         permission_mode: {
           type: 'string',
@@ -287,13 +297,13 @@ export function delegateArgs(args, model, files = {}) {
  * How to start `claude`. On Windows an npm-installed `claude` is a .cmd shim that
  * only runs through cmd.exe, so prefer a real claude.exe on PATH (native installer).
  */
-export function resolveClaudeCommand(bin, platform = process.platform, env = process.env) {
+export function resolveClaudeCommand(bin, platform = process.platform, env = process.env, exists = existsSync) {
   if (platform !== 'win32' || /\.exe$/i.test(bin)) return { command: bin, shell: false };
-  if (!/[\\/]/.test(bin)) {
-    for (const dir of (env.PATH ?? env.Path ?? '').split(';')) {
-      if (dir && existsSync(join(dir, `${bin}.exe`))) return { command: join(dir, `${bin}.exe`), shell: false };
-    }
-  }
+  if (/[\\/]/.test(bin)) return { command: bin, shell: /\.(cmd|bat)$/i.test(bin) };
+  // Search PATH ourselves: cmd.exe would also look in the current directory first.
+  const dirs = (env.PATH ?? env.Path ?? '').split(';').filter(Boolean);
+  for (const ext of ['.exe', '.cmd', '.bat'])
+    for (const dir of dirs) if (exists(join(dir, `${bin}${ext}`))) return { command: join(dir, `${bin}${ext}`), shell: ext !== '.exe' };
   return { command: bin, shell: true };
 }
 
@@ -357,8 +367,15 @@ async function delegateTool(args, settings, ctx) {
   const health = await bridgeStatus(settings);
   if (!health.ok) return textResult(health.text, true);
   // Claude Code passes the project root through the plugin config (WEBGPT4CC_PROJECT_DIR).
-  const projectDir = process.env.WEBGPT4CC_PROJECT_DIR && !process.env.WEBGPT4CC_PROJECT_DIR.includes('${') ? process.env.WEBGPT4CC_PROJECT_DIR : process.cwd();
-  const cwd = args.cwd ? resolve(projectDir, String(args.cwd)) : projectDir;
+  const projectDir = realOrSelf(
+    process.env.WEBGPT4CC_PROJECT_DIR && !process.env.WEBGPT4CC_PROJECT_DIR.includes('${') ? process.env.WEBGPT4CC_PROJECT_DIR : process.cwd(),
+  );
+  const cwd = args.cwd ? realOrSelf(resolve(projectDir, String(args.cwd))) : projectDir;
+  // `claude -p` skips the workspace-trust dialog, so never start it in a directory outside the project
+  // (its hooks and settings would run unreviewed).
+  const rel = relative(projectDir, cwd);
+  if (rel.startsWith('..') || isAbsolute(rel)) return textResult(`cwd must be inside the current project (${projectDir}).`, true);
+  if (!existsSync(cwd)) return textResult(`cwd does not exist: ${cwd}`, true);
   const model = args.model || settings.model;
   const timeoutMs = Math.max(1, Number(args.timeout_minutes) || 60) * 60_000;
   const started = Date.now();

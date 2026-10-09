@@ -1,7 +1,6 @@
 // HTTP server: Anthropic-compatible endpoints + the extension WebSocket.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { promisify } from 'node:util';
 import * as zlib from 'node:zlib';
 import { sendJson, sendJsonError } from './anthropic/sse.ts';
 import type { BridgeConfig } from './config.ts';
@@ -14,14 +13,18 @@ import { VERSION } from './version.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
+// maxOutputLength bounds the decompressed size (a tiny brotli body can expand to gigabytes).
+const LIMIT = { maxOutputLength: MAX_BODY_BYTES };
+type Decode = (b: Buffer, o: zlib.ZlibOptions | zlib.BrotliOptions, cb: (e: Error | null, r: Buffer) => void) => void;
+const withLimit = (fn: Decode) => (b: Buffer) => new Promise<Buffer>((res, rej) => fn(b, LIMIT, (e, r) => (e ? rej(e) : res(r))));
 const decoders: Record<string, (b: Buffer) => Promise<Buffer>> = {
-  gzip: promisify(zlib.gunzip),
-  'x-gzip': promisify(zlib.gunzip),
-  deflate: promisify(zlib.inflate),
-  br: promisify(zlib.brotliDecompress),
+  gzip: withLimit(zlib.gunzip as unknown as Decode),
+  'x-gzip': withLimit(zlib.gunzip as unknown as Decode),
+  deflate: withLimit(zlib.inflate as unknown as Decode),
+  br: withLimit(zlib.brotliDecompress as unknown as Decode),
 };
-const zstd = (zlib as unknown as { zstdDecompress?: (b: Buffer, cb: (e: Error | null, r: Buffer) => void) => void }).zstdDecompress;
-if (zstd) decoders.zstd = promisify(zstd);
+const zstd = (zlib as unknown as { zstdDecompress?: Decode }).zstdDecompress;
+if (zstd) decoders.zstd = withLimit(zstd);
 
 export async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -53,7 +56,7 @@ function hostName(hostHeader: string | undefined): string {
 }
 
 export function isLoopback(host: string): boolean {
-  return LOOPBACK_HOSTS.has(host) || host.startsWith('127.');
+  return LOOPBACK_HOSTS.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 function bearer(req: IncomingMessage): string | undefined {

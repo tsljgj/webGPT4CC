@@ -12,10 +12,11 @@ process whose model is the user's ChatGPT (through the local webGPT4CC bridge an
 browser extension). That agent:
 
 - starts with **no knowledge of this conversation** — everything it needs must be in the brief;
-- works in the current project by default (or `cwd`), with only the tools in
-  `allowed_tools` (default: Read, Glob, Grep, Edit, Write, NotebookEdit, TodoWrite —
-  **no Bash** unless you add it, e.g. `"Bash(npm test:*)"`). Nobody can approve other
-  tools while it runs, so they are denied;
+- works in the current project by default (or a `cwd` inside it). It may edit files inside
+  that directory; beyond that it can only use the tools in `allowed_tools` (default: Read,
+  Glob, Grep, TodoWrite — **no Bash** unless you add rules such as `"Bash(npm test:*)"`).
+  Nobody can approve other tools while it runs, so they are denied. Don't add bare
+  `"Write"`/`"Edit"` rules: they would let it write anywhere on disk;
 - spends one ChatGPT message per step, and is slower than you.
 
 ## How to delegate

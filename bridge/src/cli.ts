@@ -87,7 +87,8 @@ async function serve(flags: Record<string, string | boolean>): Promise<void> {
   const url = bridgeUrl({ host, port });
   log.info(`webGPT4CC bridge ${VERSION} listening on ${url} (provider: ${provider.name})`);
   if (config.provider === 'extension') {
-    log.info(`extension pairing: bridge URL ${url}  token ${config.extensionToken || '(none)'}`);
+    // Printed directly (not through the logger) so the token never lands in a --dump-dir log file.
+    process.stderr.write(`extension pairing: bridge URL ${url}  token ${config.extensionToken || '(none)'}\n`);
     log.info('waiting for the browser extension... (open chatgpt.com in Chrome with the webGPT4CC extension)');
   }
   log.info(`run Claude Code with: gptcc   (or: eval "$(webgpt4cc env)" && claude)`);
@@ -151,11 +152,18 @@ async function doctor(): Promise<number> {
  * How to start `claude`. On Windows an npm-installed `claude` is a .cmd shim that
  * only runs through cmd.exe, so prefer a real claude.exe on PATH (native installer).
  */
-export function resolveClaudeCommand(bin = 'claude', platform = process.platform, env = process.env): { command: string; shell: boolean } {
+export function resolveClaudeCommand(
+  bin = 'claude',
+  platform = process.platform,
+  env = process.env,
+  exists: (p: string) => boolean = existsSync,
+): { command: string; shell: boolean } {
   if (platform !== 'win32' || /\.exe$/i.test(bin)) return { command: bin, shell: false };
-  for (const dir of (env.PATH ?? env.Path ?? '').split(';')) {
-    if (dir && existsSync(join(dir, `${bin}.exe`))) return { command: join(dir, `${bin}.exe`), shell: false };
-  }
+  if (/[\\/]/.test(bin)) return { command: bin, shell: /\.(cmd|bat)$/i.test(bin) };
+  // Search PATH ourselves: cmd.exe would also look in the current directory first.
+  const dirs = (env.PATH ?? env.Path ?? '').split(';').filter(Boolean);
+  for (const ext of ['.exe', '.cmd', '.bat'])
+    for (const dir of dirs) if (exists(join(dir, `${bin}${ext}`))) return { command: join(dir, `${bin}${ext}`), shell: ext !== '.exe' };
   return { command: bin, shell: true };
 }
 
@@ -170,18 +178,21 @@ function runClaude(args: string[], flags: Record<string, string | boolean>): voi
   const env = childEnv(process.env, bridgeEnv);
   const { command, shell } = resolveClaudeCommand(process.env.WEBGPT4CC_CLAUDE_BIN || 'claude');
   let finalArgs = claudeArgs(args, bridgeEnv);
+  // The settings layer carries the bridge token: pass it as a private temp file rather than on the
+  // command line (visible to other local users in `ps`, and mangled by cmd.exe on Windows).
   let tmp = '';
-  if (shell) {
-    // cmd.exe mangles JSON: hand the settings layer over as a private temp file.
-    const i = finalArgs.indexOf('--settings');
-    if (i >= 0 && finalArgs[i + 1]?.startsWith('{')) {
-      tmp = mkdtempSync(join(tmpdir(), 'webgpt4cc-'));
-      writeFileSync(join(tmp, 'settings.json'), finalArgs[i + 1]!, { mode: 0o600 });
-      finalArgs = [...finalArgs.slice(0, i + 1), join(tmp, 'settings.json'), ...finalArgs.slice(i + 2)];
-    }
-    finalArgs = finalArgs.map(cmdQuote);
+  const i = finalArgs.indexOf('--settings');
+  if (i >= 0 && finalArgs[i + 1]?.startsWith('{')) {
+    tmp = mkdtempSync(join(tmpdir(), 'webgpt4cc-'));
+    writeFileSync(join(tmp, 'settings.json'), finalArgs[i + 1]!, { mode: 0o600 });
+    finalArgs = [...finalArgs.slice(0, i + 1), join(tmp, 'settings.json'), ...finalArgs.slice(i + 2)];
   }
+  if (shell) finalArgs = finalArgs.map(cmdQuote);
   const cleanup = () => tmp && rmSync(tmp, { recursive: true, force: true });
+  process.on('SIGTERM', () => {
+    cleanup();
+    process.exit(143);
+  });
   const child = spawn(shell ? cmdQuote(command) : command, finalArgs, { stdio: 'inherit', env, shell });
   // Ctrl+C reaches claude directly (same process group); don't let it kill the launcher first.
   process.on('SIGINT', () => {});

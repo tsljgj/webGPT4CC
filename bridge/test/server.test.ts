@@ -571,3 +571,40 @@ describe('interruptions and concurrency', () => {
     }
   });
 });
+
+describe('hardening', () => {
+  it('treats only real 127.x addresses as loopback', async () => {
+    const { isLoopback } = await import('../src/server.ts');
+    assert.equal(isLoopback('127.0.0.1'), true);
+    assert.equal(isLoopback('127.1.2.3'), true);
+    assert.equal(isLoopback('127.evil.example'), false);
+    assert.equal(isLoopback('localhost'), true);
+  });
+
+  it('rejects decompression bombs', async () => {
+    const { brotliCompressSync } = await import('node:zlib');
+    const ctx = await start(() => 'x');
+    try {
+      const bomb = brotliCompressSync(Buffer.alloc(80 * 1024 * 1024, 32));
+      const r = await post(ctx.url, '/v1/messages', new Uint8Array(bomb), { 'content-encoding': 'br' });
+      assert.equal(r.status, 400);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+
+  it('writes private dump files', async () => {
+    const { mkdtempSync, statSync, readdirSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createLogger } = await import('../src/log.ts');
+    const dir = join(mkdtempSync(join(tmpdir(), 'wg-dump-')), 'd');
+    const log = createLogger('info', dir, () => {});
+    log.info('hello');
+    log.dump('a.txt', 'secret prompt');
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(dir).mode & 0o777, 0o700);
+      for (const f of readdirSync(dir)) assert.equal(statSync(join(dir, f)).mode & 0o777, 0o600);
+    }
+  });
+});

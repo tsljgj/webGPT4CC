@@ -99,9 +99,9 @@ NotebookEdit、AskUserQuestion，不启用子 agent）。第一条 ChatGPT 消�
 ```
 
 然后直接对 Claude 说“把这个交给 GPT 做”，或者使用 `/gpt-web:delegate <任务>`、
-`/gpt-web:ask <问题>`、`/gpt-web:status`。被委派的 agent 默认只有读、搜索和编辑工具；
-Claude 可以按任务授予 `Bash(...)` 规则，也可以传 `lite: true` 得到更轻量的 delegate。
-被委派的 agent 不能再继续委派。
+`/gpt-web:ask <问题>`、`/gpt-web:status`。被委派的 agent 默认可以读取、搜索，并编辑项目目录内的文件
+（它以 `acceptEdits` 模式无人值守运行，其他操作都会被拒绝）。Claude 可以按任务授予 `Bash(...)` 规则，
+也可以传 `lite: true` 得到更轻量的 delegate。被委派的 agent 不能再继续委派。
 
 **在你自己的代码里（Claude Agent SDK）：** 见 [examples/agent-sdk.ts](examples/agent-sdk.ts)。
 

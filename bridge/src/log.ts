@@ -1,6 +1,31 @@
 // Tiny leveled logger (stderr) with optional prompt/reply dumps.
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants, lstatSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
+
+/** Prompts contain the user's code: dump files are private and never follow planted symlinks. */
+const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+const writeFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | NOFOLLOW;
+const appendFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | NOFOLLOW;
+
+function writePrivate(path: string, data: string, flags: number): void {
+  const fd = openSync(path, flags, 0o600);
+  try {
+    writeSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function prepareDumpDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`dump dir ${dir} is not a plain directory`);
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best effort (Windows) */
+  }
+}
 
 export type Level = 'debug' | 'info' | 'warn' | 'error';
 const ORDER: Record<Level, number> = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -15,7 +40,7 @@ export interface Logger {
 
 export function createLogger(level: Level = 'info', dumpDir = '', sink: (line: string) => void = (l) => process.stderr.write(l + '\n')): Logger {
   const min = ORDER[level] ?? 20;
-  if (dumpDir) mkdirSync(dumpDir, { recursive: true });
+  if (dumpDir) prepareDumpDir(dumpDir);
   const emit = (lvl: Level, msg: string, data?: unknown) => {
     if (ORDER[lvl] < min) return;
     const ts = new Date().toISOString().slice(11, 23);
@@ -24,7 +49,7 @@ export function createLogger(level: Level = 'info', dumpDir = '', sink: (line: s
     sink(line);
     if (dumpDir) {
       try {
-        appendFileSync(join(dumpDir, 'bridge.log'), line + '\n');
+        writePrivate(join(dumpDir, 'bridge.log'), line + '\n', appendFlags);
       } catch {
         /* ignore */
       }
@@ -38,7 +63,7 @@ export function createLogger(level: Level = 'info', dumpDir = '', sink: (line: s
     dump: (name, content) => {
       if (!dumpDir) return;
       try {
-        writeFileSync(join(dumpDir, name.replace(/[^\w.-]/g, '_')), content);
+        writePrivate(join(dumpDir, name.replace(/[^\w.-]/g, '_')), content, writeFlags);
       } catch {
         /* ignore */
       }

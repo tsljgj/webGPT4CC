@@ -154,6 +154,12 @@ describe('webgpt4cc MCP server', () => {
     assert.equal(echoed.appendPrompt, 'be "careful" & quick');
   });
 
+  it('refuses a cwd outside the project', async () => {
+    const r = await mcp.request('tools/call', { name: 'delegate', arguments: { task: 't', cwd: '/' } });
+    assert.equal(r.result.isError, true);
+    assert.match(r.result.content[0].text, /inside the current project/);
+  });
+
   it('rejects unknown tools', async () => {
     const r = await mcp.request('tools/call', { name: 'nope', arguments: {} });
     assert.equal(r.error.code, -32602);
@@ -178,6 +184,7 @@ describe('helpers', () => {
     const a = delegateArgs({ task: 't' }, 'chatgpt-web', {});
     assert.deepEqual(a.slice(0, 6), ['-p', '--output-format', 'stream-json', '--verbose', '--model', 'chatgpt-web']);
     assert.ok(!a[a.indexOf('--allowedTools') + 1].includes('Bash'));
+    assert.ok(!/\b(Write|Edit)\b/.test(a[a.indexOf('--allowedTools') + 1]), 'edits come from acceptEdits, scoped to cwd');
     assert.equal(a[a.indexOf('--permission-mode') + 1], 'acceptEdits');
     assert.equal(delegateArgs({ permission_mode: 'bypassPermissions' }, 'm')[delegateArgs({ permission_mode: 'bypassPermissions' }, 'm').indexOf('--permission-mode') + 1], 'acceptEdits');
   });
@@ -193,6 +200,8 @@ describe('helpers', () => {
     assert.deepEqual(resolveClaudeCommand('claude', 'linux'), { command: 'claude', shell: false });
     assert.deepEqual(resolveClaudeCommand('C:/x/claude.exe', 'win32', {}), { command: 'C:/x/claude.exe', shell: false });
     assert.deepEqual(resolveClaudeCommand('claude', 'win32', { PATH: '' }), { command: 'claude', shell: true });
+    const only = (p) => p.replace(/\\/g, '/') === 'C:/npm/claude.cmd';
+    assert.deepEqual(resolveClaudeCommand('claude', 'win32', { PATH: 'C:/npm' }, only), { command: join('C:/npm', 'claude.cmd'), shell: true });
   });
 
   it('summarizes stream-json output', () => {
