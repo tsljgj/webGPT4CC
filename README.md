@@ -130,6 +130,7 @@ tools by default. Claude can grant `Bash(...)` rules per task.
 | `webSearch` | `chatgpt` | Claude Code's WebSearch tool uses ChatGPT's own browsing; `disabled` refuses it |
 | `render.toolDescriptionMaxChars` | `2000` | Truncate long tool descriptions to keep the first message small (0 = full) |
 | `render.excludeTools` | `DesignSync`, `ScheduleWakeup`, `Cron*`, `Workflow`, `ReportFindings` | Tool names never shown to the model (rarely useful through ChatGPT, about 20 KB). `[]` shows everything |
+| `render.maxPromptChars` | `100000` | Upper bound for one ChatGPT message; older history and huge tool results are shortened to fit |
 | `dumpDir` | `""` | Write every prompt and reply here (debugging) |
 
 Environment overrides: `WEBGPT4CC_PORT`, `WEBGPT4CC_HOST`, `WEBGPT4CC_PROVIDER`,

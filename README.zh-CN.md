@@ -122,6 +122,7 @@ Claude 可以按任务授予 `Bash(...)` 规则。
 | `webSearch` | `chatgpt` | Claude Code 的 WebSearch 工具交给 ChatGPT 自带的联网搜索；`disabled` 表示拒绝 |
 | `render.toolDescriptionMaxChars` | `2000` | 截断过长的工具描述，缩小第一条消息（0 表示不截断） |
 | `render.excludeTools` | `DesignSync`、`ScheduleWakeup`、`Cron*`、`Workflow`、`ReportFindings` | 不展示给模型的工具名（通过 ChatGPT 很少用得上，约 20 KB）。设为 `[]` 则全部展示 |
+| `render.maxPromptChars` | `100000` | 单条 ChatGPT 消息的长度上限；超出时会缩短较早的历史和过大的工具结果 |
 | `dumpDir` | `""` | 把每个 prompt 和回复写到这个目录（调试用） |
 
 也可以用环境变量覆盖：`WEBGPT4CC_PORT`、`WEBGPT4CC_HOST`、`WEBGPT4CC_PROVIDER`、
