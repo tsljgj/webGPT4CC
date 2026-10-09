@@ -158,7 +158,7 @@ All frames are JSON objects with a `type`.
 
 | type | fields | meaning |
 |---|---|---|
-| `status` | `status`, `detail?` | `accepted`, `navigating`, `ready`, `typing`, `submitted`, `generating`, `thinking`, … The bridge starts its HTTP stream at `submitted`. |
+| `status` | `status`, `detail?` | `accepted`, `navigating`, `ready`, `typing`, `submitted`, `generating`, `thinking`, … The bridge starts its HTTP stream at `submitted`. For `thinking`, `detail` may carry the whole reasoning summary so far; the bridge streams it to Claude Code as a thinking block. |
 | `text` | `text` | Whole reply text so far (raw markdown as produced by the model, **not** rendered DOM text). |
 | `done` | `text`, `conversationId`, `messageId?`, `finishReason?` | Final raw text of the assistant reply. |
 | `error` | `code`, `message`, `retryAfterMs?` | `code` ∈ `no_worker`, `rate_limited`, `too_long`, `not_logged_in`, `ui_error`, `network`, `conversation_not_found`, `timeout`, `aborted`, `internal`. |

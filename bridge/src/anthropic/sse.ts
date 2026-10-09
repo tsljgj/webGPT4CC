@@ -66,6 +66,9 @@ export function sendJson(res: ServerResponse, status: number, value: unknown): v
 export class SseMessageWriter {
   private index = -1;
   private openText = false;
+  private openThinking = false;
+  private thinkingClosed = false;
+  private hadContent = false;
   private finished = false;
   private pingTimer: NodeJS.Timeout | undefined;
   private readonly res: ServerResponse;
@@ -114,9 +117,46 @@ export class SseMessageWriter {
     this.event('ping', { type: 'ping' });
   }
 
+  /**
+   * Append to a thinking block (ChatGPT's reasoning summary). Only allowed before
+   * any text or tool block; it is closed with a placeholder signature as soon as
+   * real content starts.
+   */
+  thinking(delta: string): void {
+    if (!delta || this.thinkingClosed) return;
+    if (!this.openThinking) {
+      this.index++;
+      this.openThinking = true;
+      this.event('content_block_start', {
+        type: 'content_block_start',
+        index: this.index,
+        content_block: { type: 'thinking', thinking: '', signature: '' },
+      });
+    }
+    this.event('content_block_delta', {
+      type: 'content_block_delta',
+      index: this.index,
+      delta: { type: 'thinking_delta', thinking: delta },
+    });
+  }
+
+  private closeThinking(): void {
+    this.thinkingClosed = true;
+    if (!this.openThinking) return;
+    this.event('content_block_delta', {
+      type: 'content_block_delta',
+      index: this.index,
+      delta: { type: 'signature_delta', signature: 'webgpt4cc' },
+    });
+    this.event('content_block_stop', { type: 'content_block_stop', index: this.index });
+    this.openThinking = false;
+  }
+
   /** Append text to the current text block, opening one if needed. */
   text(delta: string): void {
     if (!delta) return;
+    this.closeThinking();
+    this.hadContent = true;
     if (!this.openText) {
       this.index++;
       this.openText = true;
@@ -144,7 +184,9 @@ export class SseMessageWriter {
       this.text(block.text);
       return;
     }
+    this.closeThinking();
     this.closeText();
+    this.hadContent = true;
     this.index++;
     this.event('content_block_start', {
       type: 'content_block_start',
@@ -162,8 +204,9 @@ export class SseMessageWriter {
   /** Close the message. `outputTokens` is reported in message_delta.usage. */
   finish(stopReason: StopReason, usage: Usage): void {
     if (this.finished) return;
+    this.closeThinking();
     this.closeText();
-    if (this.index < 0) {
+    if (this.index < 0 || !this.hadContent) {
       // The API never returns an empty content array for end_turn in practice; emit an empty text block.
       this.text(' ');
       this.closeText();

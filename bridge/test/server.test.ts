@@ -430,3 +430,23 @@ describe('session persistence', () => {
     await b.bridge.close();
   });
 });
+
+describe('reasoning summaries', () => {
+  it('streams ChatGPT reasoning as a thinking block before the answer', async () => {
+    const ctx = await start(() => ({ thinking: 'Considering the options carefully.', reply: 'Answer.' }));
+    try {
+      const r = await post(ctx.url, '/v1/messages', { model: 'm', max_tokens: 100, stream: true, tools: TOOLS, messages: [{ role: 'user', content: 'think' }] });
+      const events = parseSse(await r.text());
+      const starts = events.filter((e) => e.event === 'content_block_start').map((e) => (e.data.content_block as { type: string }).type);
+      assert.deepEqual(starts, ['thinking', 'text']);
+      const thinking = events
+        .filter((e) => e.event === 'content_block_delta' && (e.data.delta as { type: string }).type === 'thinking_delta')
+        .map((e) => (e.data.delta as { thinking: string }).thinking)
+        .join('');
+      assert.equal(thinking, 'Considering the options carefully.');
+      assert.ok(events.some((e) => e.event === 'content_block_delta' && (e.data.delta as { type: string }).type === 'signature_delta'));
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+});

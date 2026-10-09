@@ -388,8 +388,16 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   };
   let emitted = '';
   let lastFull = '';
+  let thoughts = '';
   const onProgress = (ev: ChatEvent) => {
-    if (ev.type === 'status' && (ev.status === 'submitted' || ev.status === 'generating')) startStream();
+    if (ev.type === 'status' && (ev.status === 'submitted' || ev.status === 'generating' || ev.status === 'thinking')) startStream();
+    // ChatGPT's reasoning summary (whole text so far) -> a thinking block, before any content.
+    if (ev.type === 'status' && ev.status === 'thinking' && ev.detail && config.showThinking && stream && writer && !emitted) {
+      if (ev.detail.startsWith(thoughts) && ev.detail.length > thoughts.length) {
+        writer.thinking(ev.detail.slice(thoughts.length));
+        thoughts = ev.detail;
+      }
+    }
     if (ev.type !== 'text') return;
     startStream();
     lastFull = ev.text;

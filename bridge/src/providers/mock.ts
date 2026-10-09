@@ -7,6 +7,8 @@ import type { ChatEvent, ChatJob, ChatProvider, ProviderStatus } from './types.t
 export interface MockTurn {
   /** Reply text in the bridge protocol (may contain <tool_call> blocks). */
   reply: string;
+  /** Simulated reasoning summary, streamed as `status: thinking` events before the reply. */
+  thinking?: string;
   /** Simulated error instead of a reply. */
   error?: { code: 'rate_limited' | 'too_long' | 'ui_error' | 'network' | 'timeout'; message: string };
 }
@@ -76,6 +78,11 @@ export class MockProvider implements ChatProvider {
     if (turn.error) {
       yield { type: 'error', code: turn.error.code, message: turn.error.message };
       return;
+    }
+    if (turn.thinking) {
+      const step = Math.max(1, this.chunkSize || turn.thinking.length);
+      for (let i = step; i < turn.thinking.length + step; i += step)
+        yield { type: 'status', status: 'thinking', detail: turn.thinking.slice(0, Math.min(i, turn.thinking.length)) };
     }
     const text = turn.reply;
     if (this.chunkSize > 0) {

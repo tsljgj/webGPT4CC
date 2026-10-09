@@ -54,6 +54,8 @@ export interface BridgeConfig {
   claudeContextWindow: number;
   /** Stream text to Claude Code as it arrives (otherwise everything is sent at the end). */
   stream: boolean;
+  /** Show ChatGPT's reasoning summaries as Claude Code "thinking" while the model thinks. */
+  showThinking: boolean;
   render: RenderOptions;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   /** If set, every prompt and reply is written to this directory (for debugging). */
@@ -88,6 +90,7 @@ export function defaultConfig(): BridgeConfig {
     webSearch: 'chatgpt',
     claudeContextWindow: 128_000,
     stream: true,
+    showThinking: true,
     render: { ...DEFAULT_RENDER_OPTIONS },
     logLevel: 'info',
     dumpDir: '',
