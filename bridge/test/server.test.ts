@@ -297,3 +297,36 @@ describe('error mapping', () => {
     }
   });
 });
+
+describe('client disconnects', () => {
+  it('lets a retry adopt a turn whose client went away', async () => {
+    const config: BridgeConfig = { ...defaultConfig(), port: 0, authToken: TOKEN, provider: 'mock', orphanGraceMs: 5_000 };
+    const mock = new MockProvider({ script: () => 'slow but steady reply', chunkSize: 2, chunkDelayMs: 30 });
+    const bridge = createBridgeServer(config, silentLogger, mock);
+    await bridge.listen();
+    try {
+      const body = { model: 'claude-x', max_tokens: 100, stream: true, tools: TOOLS, metadata: { user_id: 's1' }, messages: [{ role: 'user', content: 'go' }] };
+      const ac = new AbortController();
+      const first = post(bridge.url(), '/v1/messages', body, {}).then((r) => r.body?.getReader().read());
+      void first;
+      // Abort the first client shortly after it starts receiving.
+      const aborted = fetch(bridge.url() + '/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+        body: JSON.stringify({ ...body, metadata: { user_id: 's2' } }),
+        signal: ac.signal,
+      }).catch(() => null);
+      await new Promise((r) => setTimeout(r, 150));
+      ac.abort();
+      await aborted;
+      // Retry of the aborted request (same session id) adopts the running turn.
+      const retry = await post(bridge.url(), '/v1/messages', { ...body, metadata: { user_id: 's2' } });
+      const msg = assemble(parseSse(await retry.text()));
+      assert.equal(msg.content.map((b) => b.text).join(''), 'slow but steady reply');
+      // Two distinct requests (s1, s2) -> exactly two ChatGPT turns; the retry added none.
+      assert.equal(mock.jobs.length, 2);
+    } finally {
+      await bridge.close();
+    }
+  });
+});

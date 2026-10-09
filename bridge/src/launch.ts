@@ -45,8 +45,15 @@ export function claudeEnv(config: BridgeConfig, model?: string): Record<string, 
     ANTHROPIC_DEFAULT_HAIKU_MODEL: small,
     ANTHROPIC_SMALL_FAST_MODEL: small,
     CLAUDE_CODE_SUBAGENT_MODEL: main,
-    // ChatGPT replies (especially thinking models) can take many minutes.
+    // ChatGPT replies (especially thinking models) can take many minutes, with long
+    // silent stretches while the model thinks: relax Claude Code's timeouts and
+    // stream watchdogs (the bridge sends keep-alive pings every 10 s).
     API_TIMEOUT_MS: '3600000',
+    CLAUDE_ENABLE_STREAM_WATCHDOG: '0',
+    CLAUDE_STREAM_IDLE_TIMEOUT_MS: '1800000',
+    CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: '3600000',
+    // "chatgpt-web" is unknown to Claude Code; tell it the window to compact against.
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(config.claudeContextWindow),
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     DISABLE_PROMPT_CACHING: '1',
   };

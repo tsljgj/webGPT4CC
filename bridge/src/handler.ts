@@ -46,6 +46,12 @@ export interface BridgeState {
   log: Logger;
   /** Conversations whose last reply was interrupted (next message gets a note). */
   interrupted: Set<string>;
+  /**
+   * Turns whose client went away. They keep running for a grace period so that
+   * a retry of the same request (Claude Code retries after stream watchdog
+   * aborts) can adopt them instead of starting a new ChatGPT turn.
+   */
+  orphans: Map<string, { timer: NodeJS.Timeout; conversationId?: string; cancel: () => void }>;
   /** When ChatGPT reported a usage cap, fail fast until this time. */
   rateLimitedUntil: number;
   rateLimitMessage: string;
@@ -60,6 +66,7 @@ export function createState(config: BridgeConfig, provider: ChatProvider, log: L
     cache: new ResponseCache<Completed>(),
     log,
     interrupted: new Set(),
+    orphans: new Map(),
     rateLimitedUntil: 0,
     rateLimitMessage: '',
     stats: { requests: 0, chatgptTurns: 0, localReplies: 0, errors: 0, continued: 0, replayed: 0 },
@@ -306,9 +313,18 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   const rHash = requestHash(req, chatModel);
   const cached = state.cache.get(rHash);
   if (cached) {
-    log.info('duplicate request: reusing the reply already produced for it');
+    const orphan = state.orphans.get(rHash);
+    if (orphan) {
+      clearTimeout(orphan.timer);
+      state.orphans.delete(rHash);
+      log.info('retry adopted the ChatGPT turn that is still running');
+      res.on('close', () => {
+        if (!res.writableEnded) armOrphan(state, rHash, orphan.conversationId, orphan.cancel);
+      });
+    } else log.info('duplicate request: reusing the reply already produced for it');
     try {
       const done = await cached;
+      if (res.destroyed) return;
       if (stream) {
         const w = new SseMessageWriter(res, req.model);
         w.start(usage(inputTokens, 1));
@@ -322,16 +338,24 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
 
   // 3. Plan the ChatGPT turn (continue an existing conversation or start a new one).
   let plan = planTurn(state, req, kind, chatModel);
-  if (plan.conversation.kind === 'continue') state.stats.continued++;
-  else if (lastAssistantIndex(req.messages) >= 0 && kind === 'main') state.stats.replayed++;
+  if (plan.conversation.kind === 'continue') {
+    state.stats.continued++;
+    // A new request for this conversation supersedes an abandoned turn on it.
+    const convId = plan.conversation.conversationId;
+    for (const [key, o] of state.orphans)
+      if (o.conversationId === convId) {
+        log.info('cancelling an abandoned turn in the same conversation');
+        clearTimeout(o.timer);
+        state.orphans.delete(key);
+        o.cancel();
+      }
+  } else if (lastAssistantIndex(req.messages) >= 0 && kind === 'main') state.stats.replayed++;
 
   const abort = new AbortController();
   let finished = false;
+  const conversationId = plan.conversation.kind === 'continue' ? plan.conversation.conversationId : undefined;
   res.on('close', () => {
-    if (!finished) {
-      log.info('client disconnected; cancelling the ChatGPT turn');
-      abort.abort();
-    }
+    if (!finished) armOrphan(state, rHash, conversationId, () => abort.abort());
   });
 
   let writer: SseMessageWriter | undefined;
@@ -401,8 +425,10 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
       state.interrupted.delete(result.conversationId);
     }
     finished = true;
+    clearOrphan(state, rHash);
     const completed: Completed = { blocks: done.blocks, stopReason: done.stopReason, outputTokens: done.outputTokens };
     resolveDone(completed);
+    if (res.destroyed) return;
     log.info(
       `reply: ${done.blocks.filter((b) => b.type === 'tool_use').map((b) => (b as { name: string }).name).join(', ') || 'text'} (${result.text.length} chars, stop=${done.stopReason})`,
     );
@@ -414,6 +440,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     }
   } catch (e) {
     finished = true;
+    clearOrphan(state, rHash);
     state.stats.errors++;
     const err = e instanceof BridgeError ? e : new BridgeError('api_error', (e as Error)?.message ?? String(e), true);
     rejectDone(err);
@@ -431,6 +458,28 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     log.error(`turn failed: ${err.message}`);
     if (writer && !writer.closed) writer.error(err.type, err.message);
     else sendBridgeError(res, err);
+  }
+}
+
+function armOrphan(state: BridgeState, rHash: string, conversationId: string | undefined, cancel: () => void): void {
+  const graceMs = state.config.orphanGraceMs;
+  state.log.info(`client disconnected; keeping the ChatGPT turn alive ${Math.round(graceMs / 1000)}s for a retry`);
+  const existing = state.orphans.get(rHash);
+  if (existing) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    state.orphans.delete(rHash);
+    state.log.info('no retry arrived; cancelling the abandoned ChatGPT turn');
+    cancel();
+  }, graceMs);
+  timer.unref?.();
+  state.orphans.set(rHash, { timer, conversationId, cancel });
+}
+
+function clearOrphan(state: BridgeState, rHash: string): void {
+  const o = state.orphans.get(rHash);
+  if (o) {
+    clearTimeout(o.timer);
+    state.orphans.delete(rHash);
   }
 }
 

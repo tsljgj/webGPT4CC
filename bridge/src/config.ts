@@ -41,10 +41,17 @@ export interface BridgeConfig {
   jobTimeoutMs: number;
   /** How long a request waits for a browser tab to become available. */
   workerWaitMs: number;
+  /** When Claude Code disconnects mid-turn, keep the ChatGPT turn running this long for a retry to adopt it. */
+  orphanGraceMs: number;
   /** Small/fast-model requests (titles, summaries...): send to ChatGPT, or answer locally where possible. */
   backgroundRequests: 'chatgpt' | 'local';
   /** Claude Code's WebSearch tool: answer with ChatGPT's own web search, or refuse. */
   webSearch: 'chatgpt' | 'disabled';
+  /**
+   * Context window Claude Code should assume (CLAUDE_CODE_MAX_CONTEXT_TOKENS in the launcher).
+   * Claude Code auto-compacts before reaching it, which keeps ChatGPT conversations small.
+   */
+  claudeContextWindow: number;
   /** Stream text to Claude Code as it arrives (otherwise everything is sent at the end). */
   stream: boolean;
   render: RenderOptions;
@@ -74,8 +81,10 @@ export function defaultConfig(): BridgeConfig {
     maxConversationTokens: 150_000,
     jobTimeoutMs: 20 * 60_000,
     workerWaitMs: 60_000,
+    orphanGraceMs: 90_000,
     backgroundRequests: 'local',
     webSearch: 'chatgpt',
+    claudeContextWindow: 128_000,
     stream: true,
     render: { ...DEFAULT_RENDER_OPTIONS },
     logLevel: 'info',

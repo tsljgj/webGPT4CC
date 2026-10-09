@@ -1,0 +1,19 @@
+{
+  "name": "gpt-web",
+  "displayName": "ChatGPT Web Delegate (webGPT4CC)",
+  "version": "0.1.0",
+  "description": "Delegate tasks to a Claude Code agent that runs on your ChatGPT web subscription through the local webGPT4CC bridge, or ask ChatGPT for a second opinion.",
+  "author": { "name": "webGPT4CC contributors", "url": "https://github.com/tsljgj/webGPT4CC" },
+  "homepage": "https://github.com/tsljgj/webGPT4CC",
+  "repository": "https://github.com/tsljgj/webGPT4CC",
+  "license": "MIT",
+  "keywords": ["chatgpt", "delegate", "bridge", "agent-sdk", "mcp"],
+  "mcpServers": {
+    "webgpt4cc": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs"],
+      "env": { "WEBGPT4CC_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}" },
+      "timeout": 7200000
+    }
+  }
+}

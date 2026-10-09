@@ -1,0 +1,429 @@
+#!/usr/bin/env node
+// webGPT4CC MCP server (stdio, zero dependencies).
+//
+// Lets a normal Claude Code session hand work to a *second* Claude Code
+// process that runs on the user's ChatGPT web subscription through the
+// webGPT4CC bridge. The child is the regular `claude` CLI in headless SDK mode
+// (`claude -p --output-format stream-json`), i.e. the same interface the Claude
+// Agent SDK drives, with ANTHROPIC_BASE_URL pointing at the bridge.
+import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
+
+const SERVER_INFO = { name: 'webgpt4cc', version: '0.1.0' };
+const SUPPORTED_PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+
+// ---------------------------------------------------------------------------
+// Bridge configuration (shared with the webgpt4cc CLI: ~/.webgpt4cc/config.json)
+
+export function loadBridgeSettings(env = process.env) {
+  const dir = env.WEBGPT4CC_HOME || join(homedir(), '.webgpt4cc');
+  const path = env.WEBGPT4CC_CONFIG || join(dir, 'config.json');
+  let file = {};
+  try {
+    file = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    /* no config yet: defaults below */
+  }
+  const host = !file.host || file.host === '0.0.0.0' || file.host === '::' ? '127.0.0.1' : file.host;
+  const port = file.port ?? 8765;
+  return {
+    configPath: path,
+    url: (env.WEBGPT4CC_BRIDGE_URL || `http://${host.includes(':') ? `[${host}]` : host}:${port}`).replace(/\/+$/, ''),
+    token: env.WEBGPT4CC_AUTH_TOKEN ?? file.authToken ?? '',
+    model: env.WEBGPT4CC_MODEL || file.models?.default || 'chatgpt-web',
+    smallModel: file.models?.background || env.WEBGPT4CC_MODEL || file.models?.default || 'chatgpt-web',
+    claudeBin: env.WEBGPT4CC_CLAUDE_BIN || 'claude',
+    contextWindow: String(file.claudeContextWindow ?? 128000),
+  };
+}
+
+/** Variables that would make the child talk to Anthropic, or believe it is nested in another session. */
+const STRIPPED_ENV = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_CUSTOM_HEADERS',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+  'CLAUDECODE',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_SSE_PORT',
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+  'CLAUDE_CODE_GZIP_REQUEST_BODIES',
+];
+
+export function childEnv(settings, model, base = process.env) {
+  const env = { ...base };
+  for (const k of STRIPPED_ENV) delete env[k];
+  Object.assign(env, {
+    ANTHROPIC_BASE_URL: settings.url,
+    ANTHROPIC_AUTH_TOKEN: settings.token || 'webgpt4cc',
+    ANTHROPIC_MODEL: model,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: settings.smallModel,
+    ANTHROPIC_SMALL_FAST_MODEL: settings.smallModel,
+    CLAUDE_CODE_SUBAGENT_MODEL: model,
+    API_TIMEOUT_MS: '3600000',
+    CLAUDE_ENABLE_STREAM_WATCHDOG: '0',
+    CLAUDE_STREAM_IDLE_TIMEOUT_MS: '1800000',
+    CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: '3600000',
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: settings.contextWindow ?? '128000',
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    DISABLE_PROMPT_CACHING: '1',
+  });
+  return env;
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+
+const DEFAULT_ALLOWED_TOOLS = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'NotebookEdit', 'TodoWrite'];
+
+export const TOOLS = [
+  {
+    name: 'delegate',
+    description:
+      'Run a task with a separate Claude Code agent that is powered by the user\'s ChatGPT web subscription (via the local webGPT4CC bridge) instead of Claude. ' +
+      'Use it to offload self-contained work (bulk edits, writing tests, refactors, investigations) and save Claude usage. ' +
+      'The delegate starts with NO knowledge of this conversation: write a complete, self-contained brief (goal, relevant files, constraints, how to verify). ' +
+      'It works in `cwd` (default: the current project) and can only use `allowed_tools` (default: read/search/edit tools, no Bash). ' +
+      'Each of its steps costs one ChatGPT message. Returns the delegate\'s final report plus a summary of the tools it used and files it changed; ' +
+      'pass `resume_session_id` to continue the same delegate session with a follow-up instruction.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Complete, self-contained instructions for the delegate.' },
+        cwd: { type: 'string', description: 'Working directory (absolute, or relative to the current project). Default: current project.' },
+        allowed_tools: {
+          type: 'array',
+          items: { type: 'string' },
+          description: `Claude Code tool rules the delegate may use without asking, e.g. ["Read","Edit","Bash(npm test:*)"]. Default: ${DEFAULT_ALLOWED_TOOLS.join(', ')}.`,
+        },
+        permission_mode: {
+          type: 'string',
+          enum: ['default', 'acceptEdits', 'plan'],
+          description: 'Claude Code permission mode for the delegate (default: acceptEdits). Tools outside allowed_tools are denied, since nobody can approve them.',
+        },
+        model: { type: 'string', description: 'ChatGPT model slug for the bridge (default: the model selected in the ChatGPT tab).' },
+        max_turns: { type: 'integer', minimum: 1, description: 'Maximum agent turns (each turn is one ChatGPT message). Default 40.' },
+        timeout_minutes: { type: 'number', minimum: 1, description: 'Kill the delegate after this many minutes. Default 60.' },
+        resume_session_id: { type: 'string', description: 'Continue a previous delegate session (from an earlier result).' },
+        append_system_prompt: { type: 'string', description: 'Extra system instructions for the delegate.' },
+      },
+      required: ['task'],
+    },
+  },
+  {
+    name: 'ask',
+    description:
+      'Ask the ChatGPT web model a single question through the webGPT4CC bridge (no tools, no file access) — e.g. for a second opinion on a design or a bug. ' +
+      'Include all needed context in `question`; costs one ChatGPT message.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The question, with all the context it needs.' },
+        model: { type: 'string', description: 'ChatGPT model slug (default: the tab\'s model).' },
+      },
+      required: ['question'],
+    },
+  },
+  {
+    name: 'status',
+    description: 'Check whether the webGPT4CC bridge is running and a ChatGPT browser tab is connected.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+];
+
+function textResult(text, isError = false) {
+  return { content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}) };
+}
+
+async function fetchJson(url, init = {}, timeoutMs = 5000) {
+  const res = await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeoutMs) });
+  const body = await res.text();
+  let json;
+  try {
+    json = JSON.parse(body);
+  } catch {
+    json = undefined;
+  }
+  return { status: res.status, json, body };
+}
+
+export async function bridgeStatus(settings) {
+  try {
+    const { json } = await fetchJson(`${settings.url}/health`);
+    if (!json?.ok) return { ok: false, text: `The webGPT4CC bridge at ${settings.url} answered unexpectedly.` };
+    const workers = json.workers ?? [];
+    const ready = workers.filter((w) => w.ready).length;
+    if (json.provider === 'extension' && !json.connected)
+      return { ok: false, text: `Bridge ${json.version} is running at ${settings.url}, but the browser extension is not connected. Open Chrome with the webGPT4CC extension and pair it (\`webgpt4cc pair\`).` };
+    if (json.provider === 'extension' && ready === 0)
+      return { ok: false, text: `Bridge ${json.version} is running and the extension is connected, but no ChatGPT worker tab is ready. Click "Open worker tab" in the extension popup and make sure you are logged in to chatgpt.com.` };
+    return {
+      ok: true,
+      text: `Bridge ${json.version} at ${settings.url}: provider ${json.provider}, ${ready}/${workers.length} worker tab(s) ready, ${json.queued ?? 0} queued. Stats: ${JSON.stringify(json.stats ?? {})}`,
+    };
+  } catch (e) {
+    return { ok: false, text: `The webGPT4CC bridge is not reachable at ${settings.url} (${e.message}). Start it with \`webgpt4cc serve\` (or \`npx webgpt4cc serve\`).` };
+  }
+}
+
+async function askTool(args, settings, signal) {
+  const question = String(args.question ?? '').trim();
+  if (!question) return textResult('`question` is required.', true);
+  const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
+  if (settings.token) headers.authorization = `Bearer ${settings.token}`;
+  try {
+    const res = await fetch(`${settings.url}/v1/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: args.model || settings.model, max_tokens: 8192, messages: [{ role: 'user', content: question }] }),
+      signal,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) return textResult(`Bridge error ${res.status}: ${json?.error?.message ?? 'unknown error'}`, true);
+    const text = (json.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    return textResult(text || '(empty reply)');
+  } catch (e) {
+    return textResult(`Could not reach the webGPT4CC bridge at ${settings.url}: ${e.message}`, true);
+  }
+}
+
+function fmtDuration(ms) {
+  const s = Math.round(ms / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+}
+
+/** Build the `claude` argument list for a delegate run (the task itself goes to stdin). */
+export function delegateArgs(args, model) {
+  const out = ['-p', '--output-format', 'stream-json', '--verbose', '--model', model];
+  const allowed = Array.isArray(args.allowed_tools) && args.allowed_tools.length ? args.allowed_tools : DEFAULT_ALLOWED_TOOLS;
+  out.push('--allowedTools', allowed.map(String).join(','));
+  out.push('--permission-mode', ['default', 'acceptEdits', 'plan'].includes(args.permission_mode) ? args.permission_mode : 'acceptEdits');
+  out.push('--max-turns', String(Number.isInteger(args.max_turns) && args.max_turns > 0 ? args.max_turns : 40));
+  if (args.resume_session_id) out.push('--resume', String(args.resume_session_id));
+  if (args.append_system_prompt) out.push('--append-system-prompt', String(args.append_system_prompt));
+  return out;
+}
+
+/** Summarise a stream-json transcript from `claude -p --output-format stream-json --verbose`. */
+export function summarizeStream(lines) {
+  const toolCounts = new Map();
+  const files = new Set();
+  let result = null;
+  let sessionId = '';
+  let lastText = '';
+  for (const line of lines) {
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (ev.session_id) sessionId = ev.session_id;
+    if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
+      for (const b of ev.message.content) {
+        if (b.type === 'tool_use') {
+          toolCounts.set(b.name, (toolCounts.get(b.name) ?? 0) + 1);
+          const p = b.input?.file_path ?? b.input?.notebook_path;
+          if (p && ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(b.name)) files.add(String(p));
+        } else if (b.type === 'text' && b.text?.trim()) lastText = b.text.trim();
+      }
+    }
+    if (ev.type === 'result') result = ev;
+  }
+  return { toolCounts, files, result, sessionId, lastText };
+}
+
+function delegateReport(summary, stderr, elapsedMs, killedReason) {
+  const { toolCounts, files, result, sessionId, lastText } = summary;
+  const status = killedReason ? `stopped (${killedReason})` : result ? (result.is_error ? `error (${result.subtype})` : 'success') : 'no result';
+  const head = [
+    `[ChatGPT-web delegate: ${status}, ${result?.num_turns ?? '?'} turns, ${fmtDuration(result?.duration_ms ?? elapsedMs)}${sessionId ? `, session_id ${sessionId}` : ''}]`,
+  ];
+  if (toolCounts.size) head.push(`Tools used: ${[...toolCounts].map(([n, c]) => `${n}×${c}`).join(', ')}`);
+  if (files.size) head.push(`Files written/edited: ${[...files].join(', ')}`);
+  if (result?.permission_denials?.length)
+    head.push(`Denied tool uses (not in allowed_tools): ${result.permission_denials.map((d) => d.tool_name).join(', ')}`);
+  const body = (typeof result?.result === 'string' && result.result.trim()) || lastText || '(the delegate produced no final message)';
+  let text = `${head.join('\n')}\n\n${body}`;
+  if ((!result || result.is_error || killedReason) && stderr.trim()) text += `\n\nstderr (tail):\n${stderr.trim().slice(-2000)}`;
+  return { text, isError: !result || !!result.is_error || !!killedReason };
+}
+
+async function delegateTool(args, settings, ctx) {
+  const task = String(args.task ?? '').trim();
+  if (!task) return textResult('`task` is required.', true);
+  const health = await bridgeStatus(settings);
+  if (!health.ok) return textResult(health.text, true);
+  // Claude Code passes the project root through the plugin config (WEBGPT4CC_PROJECT_DIR).
+  const projectDir = process.env.WEBGPT4CC_PROJECT_DIR && !process.env.WEBGPT4CC_PROJECT_DIR.includes('${') ? process.env.WEBGPT4CC_PROJECT_DIR : process.cwd();
+  const cwd = args.cwd ? resolve(projectDir, String(args.cwd)) : projectDir;
+  const model = args.model || settings.model;
+  const timeoutMs = Math.max(1, Number(args.timeout_minutes) || 60) * 60_000;
+  const started = Date.now();
+  return await new Promise((resolvePromise) => {
+    const child = spawn(settings.claudeBin, delegateArgs(args, model), {
+      cwd,
+      env: childEnv(settings, model),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: process.platform === 'win32',
+      windowsHide: true,
+    });
+    const lines = [];
+    let stderr = '';
+    let killedReason = '';
+    let turns = 0;
+    const kill = (reason) => {
+      if (child.exitCode !== null || killedReason) return;
+      killedReason = reason;
+      child.kill('SIGTERM');
+      setTimeout(() => child.exitCode === null && child.kill('SIGKILL'), 5000).unref();
+    };
+    const timer = setTimeout(() => kill(`timeout after ${Math.round(timeoutMs / 60000)} min`), timeoutMs);
+    ctx.onCancel(() => kill('cancelled'));
+    createInterface({ input: child.stdout }).on('line', (line) => {
+      if (!line.trim()) return;
+      lines.push(line);
+      try {
+        const ev = JSON.parse(line);
+        if (ev.type === 'assistant') {
+          turns++;
+          const tools = (ev.message?.content ?? []).filter((b) => b.type === 'tool_use').map((b) => b.name);
+          ctx.progress(turns, tools.length ? `turn ${turns}: ${tools.join(', ')}` : `turn ${turns}`);
+        }
+      } catch {
+        /* ignore non-JSON lines */
+      }
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d;
+      if (stderr.length > 20_000) stderr = stderr.slice(-10_000);
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      resolvePromise(textResult(`Could not start \`${settings.claudeBin}\`: ${e.message}. Is Claude Code installed and on PATH?`, true));
+    });
+    child.on('close', () => {
+      clearTimeout(timer);
+      const { text, isError } = delegateReport(summarizeStream(lines), stderr, Date.now() - started, killedReason);
+      resolvePromise(textResult(text, isError));
+    });
+    child.stdin.end(task);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// MCP stdio transport (newline-delimited JSON-RPC 2.0)
+
+export function createServer({ write, settings = loadBridgeSettings() }) {
+  const inflight = new Map(); // request id -> { cancel }
+  const send = (msg) => write(JSON.stringify(msg) + '\n');
+  const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
+  const fail = (id, code, message) => send({ jsonrpc: '2.0', id, error: { code, message } });
+
+  async function callTool(id, params) {
+    const name = params?.name;
+    const args = params?.arguments ?? {};
+    const progressToken = params?._meta?.progressToken;
+    const cancelHandlers = [];
+    const controller = new AbortController();
+    inflight.set(id, { cancel: () => (controller.abort(), cancelHandlers.forEach((f) => f())) });
+    const ctx = {
+      onCancel: (f) => cancelHandlers.push(f),
+      progress: (progress, message) => {
+        if (progressToken !== undefined) send({ jsonrpc: '2.0', method: 'notifications/progress', params: { progressToken, progress, message } });
+      },
+    };
+    try {
+      let result;
+      if (name === 'status') {
+        const s = await bridgeStatus(settings);
+        result = textResult(s.text, !s.ok);
+      } else if (name === 'ask') result = await askTool(args, settings, controller.signal);
+      else if (name === 'delegate') result = await delegateTool(args, settings, ctx);
+      else return fail(id, -32602, `Unknown tool: ${name}`);
+      reply(id, result);
+    } catch (e) {
+      reply(id, textResult(`webgpt4cc ${name} failed: ${e?.message ?? e}`, true));
+    } finally {
+      inflight.delete(id);
+    }
+  }
+
+  return function handle(msg) {
+    if (!msg || msg.jsonrpc !== '2.0') return;
+    const { id, method, params } = msg;
+    if (method === undefined) return; // a response to something we never send
+    switch (method) {
+      case 'initialize': {
+        const requested = params?.protocolVersion;
+        reply(id, {
+          protocolVersion: SUPPORTED_PROTOCOLS.includes(requested) ? requested : SUPPORTED_PROTOCOLS[0],
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: SERVER_INFO,
+          instructions:
+            'Tools to hand work to a Claude Code agent running on the user\'s ChatGPT web subscription (webGPT4CC bridge). Check `status` first if unsure the bridge is running.',
+        });
+        return;
+      }
+      case 'notifications/initialized':
+      case 'notifications/roots/list_changed':
+        return;
+      case 'notifications/cancelled':
+        inflight.get(params?.requestId)?.cancel();
+        return;
+      case 'ping':
+        reply(id, {});
+        return;
+      case 'tools/list':
+        reply(id, { tools: TOOLS });
+        return;
+      case 'tools/call':
+        void callTool(id, params);
+        return;
+      default:
+        if (id !== undefined) fail(id, -32601, `Method not found: ${method}`);
+    }
+  };
+}
+
+function isMain() {
+  try {
+    return import.meta.url === new URL(`file://${resolve(process.argv[1] ?? '')}`).href || process.argv[1]?.endsWith('server.mjs');
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) {
+  const handle = createServer({ write: (s) => process.stdout.write(s) });
+  const rl = createInterface({ input: process.stdin });
+  rl.on('line', (line) => {
+    if (!line.trim()) return;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n');
+      return;
+    }
+    handle(msg);
+  });
+  rl.on('close', () => process.exit(0));
+}

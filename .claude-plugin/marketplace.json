@@ -1,0 +1,14 @@
+{
+  "name": "webgpt4cc",
+  "owner": { "name": "tsljgj", "url": "https://github.com/tsljgj" },
+  "description": "Plugins for running Claude Code work on a ChatGPT web subscription (webGPT4CC).",
+  "plugins": [
+    {
+      "name": "gpt-web",
+      "source": "./plugin",
+      "description": "Delegate tasks to a Claude Code agent powered by your ChatGPT web subscription (requires the webGPT4CC bridge and browser extension).",
+      "category": "productivity",
+      "tags": ["chatgpt", "delegation", "bridge"]
+    }
+  ]
+}
