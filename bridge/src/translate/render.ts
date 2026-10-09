@@ -26,13 +26,20 @@ export interface RenderOptions {
   excludeTools: string[];
 }
 
+/**
+ * Claude Code tools that are rarely useful through ChatGPT but cost ~20 KB of the
+ * first message (which is pasted into the ChatGPT composer). Set
+ * `render.excludeTools: []` in the config to advertise everything.
+ */
+export const DEFAULT_EXCLUDED_TOOLS = ['DesignSync', 'ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList', 'Workflow', 'ReportFindings'];
+
 export const DEFAULT_RENDER_OPTIONS: RenderOptions = {
-  toolDescriptionMaxChars: 0,
-  paramDescriptionMaxChars: 600,
+  toolDescriptionMaxChars: 2000,
+  paramDescriptionMaxChars: 300,
   maxToolResultChars: 120_000,
   replayToolResultBudgetChars: 200_000,
   reminderFooter: true,
-  excludeTools: [],
+  excludeTools: DEFAULT_EXCLUDED_TOOLS,
 };
 
 export function textOf(content: MessageParam['content'] | ToolResultBlock['content'] | undefined): string {

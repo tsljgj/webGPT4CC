@@ -128,8 +128,8 @@ tools by default. Claude can grant `Bash(...)` rules per task.
 | `claudeContextWindow` | `128000` | Context window Claude Code compacts against (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`) |
 | `jobTimeoutMs` | `1200000` | Max time for one ChatGPT reply |
 | `webSearch` | `chatgpt` | Claude Code's WebSearch tool uses ChatGPT's own browsing; `disabled` refuses it |
-| `render.toolDescriptionMaxChars` | `0` | Truncate tool descriptions to shrink the first message (0 = full) |
-| `render.excludeTools` | `[]` | Tool names never shown to the model |
+| `render.toolDescriptionMaxChars` | `2000` | Truncate long tool descriptions to keep the first message small (0 = full) |
+| `render.excludeTools` | `DesignSync`, `ScheduleWakeup`, `Cron*`, `Workflow`, `ReportFindings` | Tool names never shown to the model (rarely useful through ChatGPT, about 20 KB). `[]` shows everything |
 | `dumpDir` | `""` | Write every prompt and reply here (debugging) |
 
 Environment overrides: `WEBGPT4CC_PORT`, `WEBGPT4CC_HOST`, `WEBGPT4CC_PROVIDER`,

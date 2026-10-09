@@ -120,8 +120,8 @@ Claude 可以按任务授予 `Bash(...)` 规则。
 | `claudeContextWindow` | `128000` | Claude Code 做自动压缩时参照的上下文窗口（`CLAUDE_CODE_MAX_CONTEXT_TOKENS`） |
 | `jobTimeoutMs` | `1200000` | 单次 ChatGPT 回复的最长等待时间 |
 | `webSearch` | `chatgpt` | Claude Code 的 WebSearch 工具交给 ChatGPT 自带的联网搜索；`disabled` 表示拒绝 |
-| `render.toolDescriptionMaxChars` | `0` | 截断工具描述，缩小第一条消息（0 表示不截断） |
-| `render.excludeTools` | `[]` | 不展示给模型的工具名 |
+| `render.toolDescriptionMaxChars` | `2000` | 截断过长的工具描述，缩小第一条消息（0 表示不截断） |
+| `render.excludeTools` | `DesignSync`、`ScheduleWakeup`、`Cron*`、`Workflow`、`ReportFindings` | 不展示给模型的工具名（通过 ChatGPT 很少用得上，约 20 KB）。设为 `[]` 则全部展示 |
 | `dumpDir` | `""` | 把每个 prompt 和回复写到这个目录（调试用） |
 
 也可以用环境变量覆盖：`WEBGPT4CC_PORT`、`WEBGPT4CC_HOST`、`WEBGPT4CC_PROVIDER`、
