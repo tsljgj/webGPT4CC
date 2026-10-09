@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Stand-in for the `claude` CLI in tests: echoes its arguments and environment
 // through stream-json events the way `claude -p --output-format stream-json --verbose` does.
+import { readFileSync } from 'node:fs';
 let task = '';
 process.stdin.on('data', (d) => (task += d));
 process.stdin.on('end', () => {
@@ -33,6 +34,14 @@ process.stdin.on('end', () => {
       claudecode: process.env.CLAUDECODE ?? null,
       apiKey: process.env.ANTHROPIC_API_KEY ?? null,
       cwd: process.cwd(),
+      settings: (() => {
+        const i = process.argv.indexOf('--settings');
+        return i < 0 ? null : JSON.parse(readFileSync(process.argv[i + 1], 'utf8'));
+      })(),
+      appendPrompt: (() => {
+        const i = process.argv.indexOf('--append-system-prompt-file');
+        return i < 0 ? null : readFileSync(process.argv[i + 1], 'utf8');
+      })(),
     }),
   });
 });

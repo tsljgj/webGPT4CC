@@ -7,8 +7,8 @@
 // (`claude -p --output-format stream-json`), i.e. the same interface the Claude
 // Agent SDK drives, with ANTHROPIC_BASE_URL pointing at the bridge.
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
@@ -233,20 +233,62 @@ function fmtDuration(ms) {
   return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s` : `${s}s`;
 }
 
-/** Build the `claude` argument list for a delegate run (the task itself goes to stdin). */
-export function delegateArgs(args, model, env) {
+// Arguments that reach the command line are restricted to safe characters, so
+// nothing a model writes can become shell syntax when Windows needs cmd.exe to run
+// claude.cmd. Free text (the task, extra system prompt, settings JSON) goes
+// through stdin or files instead.
+const TOOL_RULE_RE = /^[A-Za-z0-9_.:*()\/ @,=+-]{1,200}$/;
+const TOKEN_RE = /^[A-Za-z0-9_.:\/@+-]{1,200}$/;
+
+export function validateDelegateArgs(args) {
+  const problems = [];
+  if (args.allowed_tools !== undefined) {
+    if (!Array.isArray(args.allowed_tools)) problems.push('allowed_tools must be an array of strings');
+    else for (const r of args.allowed_tools) if (typeof r !== 'string' || !TOOL_RULE_RE.test(r)) problems.push(`invalid tool rule: ${JSON.stringify(r)}`);
+  }
+  if (args.model !== undefined && (typeof args.model !== 'string' || !TOKEN_RE.test(args.model))) problems.push('invalid model');
+  if (args.resume_session_id !== undefined && (typeof args.resume_session_id !== 'string' || !TOKEN_RE.test(args.resume_session_id)))
+    problems.push('invalid resume_session_id');
+  return problems;
+}
+
+/**
+ * Build the `claude` argument list for a delegate run (the task itself goes to stdin).
+ * `files.settings` / `files.appendPrompt` are paths of files holding the settings
+ * JSON and the extra system prompt.
+ */
+export function delegateArgs(args, model, files = {}) {
   const out = ['-p', '--output-format', 'stream-json', '--verbose', '--model', model];
   // The --settings layer beats an `env` block in the user's ~/.claude/settings.json,
   // which would otherwise silently route the delegate somewhere else.
-  if (env) out.push('--settings', JSON.stringify({ env, disableAutoMode: 'disable' }));
+  if (files.settings) out.push('--settings', files.settings);
   if (args.lite) out.push('--bare');
   const allowed = Array.isArray(args.allowed_tools) && args.allowed_tools.length ? args.allowed_tools : DEFAULT_ALLOWED_TOOLS;
   out.push('--allowedTools', allowed.map(String).join(','));
   out.push('--permission-mode', ['default', 'acceptEdits', 'plan'].includes(args.permission_mode) ? args.permission_mode : 'acceptEdits');
   out.push('--max-turns', String(Number.isInteger(args.max_turns) && args.max_turns > 0 ? args.max_turns : 40));
   if (args.resume_session_id) out.push('--resume', String(args.resume_session_id));
-  if (args.append_system_prompt) out.push('--append-system-prompt', String(args.append_system_prompt));
+  if (files.appendPrompt) out.push('--append-system-prompt-file', files.appendPrompt);
   return out;
+}
+
+/**
+ * How to start `claude`. On Windows an npm-installed `claude` is a .cmd shim that
+ * only runs through cmd.exe, so prefer a real claude.exe on PATH (native installer).
+ */
+export function resolveClaudeCommand(bin, platform = process.platform, env = process.env) {
+  if (platform !== 'win32' || /\.exe$/i.test(bin)) return { command: bin, shell: false };
+  if (!/[\\/]/.test(bin)) {
+    for (const dir of (env.PATH ?? env.Path ?? '').split(';')) {
+      if (dir && existsSync(join(dir, `${bin}.exe`))) return { command: join(dir, `${bin}.exe`), shell: false };
+    }
+  }
+  return { command: bin, shell: true };
+}
+
+/** Quote one argument for cmd.exe (only used for validated, metacharacter-free arguments). */
+function cmdQuote(a) {
+  return /^[A-Za-z0-9_.:\/\\@=+-]+$/.test(a) ? a : `"${a.replace(/"/g, '""')}"`;
 }
 
 /** Summarise a stream-json transcript from `claude -p --output-format stream-json --verbose`. */
@@ -297,6 +339,8 @@ function delegateReport(summary, stderr, elapsedMs, killedReason) {
 async function delegateTool(args, settings, ctx) {
   const task = String(args.task ?? '').trim();
   if (!task) return textResult('`task` is required.', true);
+  const problems = validateDelegateArgs(args);
+  if (problems.length) return textResult(`Invalid arguments: ${problems.join('; ')}`, true);
   const health = await bridgeStatus(settings);
   if (!health.ok) return textResult(health.text, true);
   // Claude Code passes the project root through the plugin config (WEBGPT4CC_PROJECT_DIR).
@@ -305,14 +349,24 @@ async function delegateTool(args, settings, ctx) {
   const model = args.model || settings.model;
   const timeoutMs = Math.max(1, Number(args.timeout_minutes) || 60) * 60_000;
   const started = Date.now();
+  // Settings (they contain the bridge token) and the extra prompt go through private temp files.
+  const tmp = mkdtempSync(join(tmpdir(), 'webgpt4cc-'));
+  const files = { settings: join(tmp, 'settings.json') };
+  writeFileSync(files.settings, JSON.stringify({ env: bridgeEnv(settings, model), disableAutoMode: 'disable' }), { mode: 0o600 });
+  if (args.append_system_prompt) {
+    files.appendPrompt = join(tmp, 'append-system-prompt.md');
+    writeFileSync(files.appendPrompt, String(args.append_system_prompt), { mode: 0o600 });
+  }
+  const cleanup = () => rmSync(tmp, { recursive: true, force: true });
   return await new Promise((resolvePromise) => {
     const env = childEnv(settings, model, process.env, !!args.lite);
-    const quote = (a) => (process.platform === 'win32' && /[\s"{}]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a);
-    const child = spawn(settings.claudeBin, delegateArgs(args, model, bridgeEnv(settings, model)).map(quote), {
+    const { command, shell } = resolveClaudeCommand(settings.claudeBin);
+    const argv = delegateArgs(args, model, files);
+    const child = spawn(shell ? cmdQuote(command) : command, shell ? argv.map(cmdQuote) : argv, {
       cwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
+      shell,
       windowsHide: true,
     });
     const lines = [];
@@ -347,10 +401,12 @@ async function delegateTool(args, settings, ctx) {
     });
     child.on('error', (e) => {
       clearTimeout(timer);
+      cleanup();
       resolvePromise(textResult(`Could not start \`${settings.claudeBin}\`: ${e.message}. Is Claude Code installed and on PATH?`, true));
     });
     child.on('close', () => {
       clearTimeout(timer);
+      cleanup();
       const { text, isError } = delegateReport(summarizeStream(lines), stderr, Date.now() - started, killedReason);
       resolvePromise(textResult(text, isError));
     });

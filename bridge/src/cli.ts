@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // webgpt4cc command line: serve | pair | doctor | env | claude
 import { spawn, spawnSync } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { type BridgeConfig, configPath, loadConfig } from './config.ts';
 import { bridgeUrl, childEnv, claudeArgs, claudeEnv, formatEnv, withBareAuth } from './launch.ts';
@@ -145,16 +147,51 @@ async function doctor(): Promise<number> {
   return problems ? 1 : 0;
 }
 
+/**
+ * How to start `claude`. On Windows an npm-installed `claude` is a .cmd shim that
+ * only runs through cmd.exe, so prefer a real claude.exe on PATH (native installer).
+ */
+export function resolveClaudeCommand(bin = 'claude', platform = process.platform, env = process.env): { command: string; shell: boolean } {
+  if (platform !== 'win32' || /\.exe$/i.test(bin)) return { command: bin, shell: false };
+  for (const dir of (env.PATH ?? env.Path ?? '').split(';')) {
+    if (dir && existsSync(join(dir, `${bin}.exe`))) return { command: join(dir, `${bin}.exe`), shell: false };
+  }
+  return { command: bin, shell: true };
+}
+
+/** Quote one argument for cmd.exe. */
+function cmdQuote(a: string): string {
+  return /^[A-Za-z0-9_.:/\\@=+-]+$/.test(a) ? a : `"${a.replace(/"/g, '""')}"`;
+}
+
 function runClaude(args: string[], flags: Record<string, string | boolean>): void {
   const config = loadConfig();
   const bridgeEnv = withBareAuth(args, claudeEnv(config, typeof flags.model === 'string' ? flags.model : undefined));
   const env = childEnv(process.env, bridgeEnv);
-  // On Windows `claude` is a .cmd shim that needs a shell; quote the JSON settings for cmd.exe.
-  const finalArgs = claudeArgs(args, bridgeEnv).map((a) => (process.platform === 'win32' && /[\s"{}]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a));
-  const child = spawn('claude', finalArgs, { stdio: 'inherit', env, shell: process.platform === 'win32' });
-  child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+  const { command, shell } = resolveClaudeCommand(process.env.WEBGPT4CC_CLAUDE_BIN || 'claude');
+  let finalArgs = claudeArgs(args, bridgeEnv);
+  let tmp = '';
+  if (shell) {
+    // cmd.exe mangles JSON: hand the settings layer over as a private temp file.
+    const i = finalArgs.indexOf('--settings');
+    if (i >= 0 && finalArgs[i + 1]?.startsWith('{')) {
+      tmp = mkdtempSync(join(tmpdir(), 'webgpt4cc-'));
+      writeFileSync(join(tmp, 'settings.json'), finalArgs[i + 1]!, { mode: 0o600 });
+      finalArgs = [...finalArgs.slice(0, i + 1), join(tmp, 'settings.json'), ...finalArgs.slice(i + 2)];
+    }
+    finalArgs = finalArgs.map(cmdQuote);
+  }
+  const cleanup = () => tmp && rmSync(tmp, { recursive: true, force: true });
+  const child = spawn(shell ? cmdQuote(command) : command, finalArgs, { stdio: 'inherit', env, shell });
+  // Ctrl+C reaches claude directly (same process group); don't let it kill the launcher first.
+  process.on('SIGINT', () => {});
+  child.on('exit', (code, signal) => {
+    cleanup();
+    process.exit(code ?? (signal ? 1 : 0));
+  });
   child.on('error', (e) => {
-    console.error(`could not start claude: ${e.message}`);
+    cleanup();
+    console.error(`could not start claude: ${e.message}. Is Claude Code installed (npm i -g @anthropic-ai/claude-code)?`);
     process.exit(127);
   });
 }

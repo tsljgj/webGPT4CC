@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { delegateArgs, summarizeStream } from '../mcp/server.mjs';
+import { delegateArgs, resolveClaudeCommand, summarizeStream } from '../mcp/server.mjs';
 
 const SERVER = fileURLToPath(new URL('../mcp/server.mjs', import.meta.url));
 const FAKE_CLAUDE = fileURLToPath(new URL('./fake-claude.mjs', import.meta.url));
@@ -118,9 +118,9 @@ describe('webgpt4cc MCP server', () => {
     assert.equal(echoed.apiKey, null, 'ANTHROPIC_API_KEY must not leak into the child');
     assert.deepEqual(echoed.args.slice(0, 4), ['-p', '--output-format', 'stream-json', '--verbose']);
     assert.ok(echoed.args.includes('Read,Edit'));
-    const settings = JSON.parse(echoed.args[echoed.args.indexOf('--settings') + 1]);
-    assert.equal(settings.env.ANTHROPIC_BASE_URL, bridge.url);
-    assert.equal(settings.disableAutoMode, 'disable');
+    assert.equal(echoed.settings.env.ANTHROPIC_BASE_URL, bridge.url);
+    assert.equal(echoed.settings.env.ANTHROPIC_AUTH_TOKEN, 'tok');
+    assert.equal(echoed.settings.disableAutoMode, 'disable');
     assert.ok(mcp.notifications.some((n) => n.method === 'notifications/progress' && n.params.progressToken === 'p1'));
   });
 
@@ -138,6 +138,19 @@ describe('webgpt4cc MCP server', () => {
     const r = await call;
     assert.equal(r.result.isError, true);
     assert.match(r.result.content[0].text, /stopped \(cancelled\)/);
+  });
+
+  it('rejects tool rules with shell metacharacters', async () => {
+    const r = await mcp.request('tools/call', { name: 'delegate', arguments: { task: 't', allowed_tools: ['Bash(x) & calc'] } });
+    assert.equal(r.result.isError, true);
+    assert.match(r.result.content[0].text, /invalid tool rule/);
+  });
+
+  it('passes the extra system prompt through a file', async () => {
+    const r = await mcp.request('tools/call', { name: 'delegate', arguments: { task: 't', append_system_prompt: 'be "careful" & quick' } });
+    const text = r.result.content[0].text;
+    const echoed = JSON.parse(text.slice(text.indexOf('{')));
+    assert.equal(echoed.appendPrompt, 'be "careful" & quick');
   });
 
   it('rejects unknown tools', async () => {
@@ -161,11 +174,17 @@ describe('delegate when the bridge is down', () => {
 
 describe('helpers', () => {
   it('builds claude arguments with safe defaults', () => {
-    const a = delegateArgs({ task: 't' }, 'chatgpt-web');
+    const a = delegateArgs({ task: 't' }, 'chatgpt-web', {});
     assert.deepEqual(a.slice(0, 6), ['-p', '--output-format', 'stream-json', '--verbose', '--model', 'chatgpt-web']);
     assert.ok(!a[a.indexOf('--allowedTools') + 1].includes('Bash'));
     assert.equal(a[a.indexOf('--permission-mode') + 1], 'acceptEdits');
     assert.equal(delegateArgs({ permission_mode: 'bypassPermissions' }, 'm')[delegateArgs({ permission_mode: 'bypassPermissions' }, 'm').indexOf('--permission-mode') + 1], 'acceptEdits');
+  });
+
+  it('only uses a shell on Windows when no claude.exe is found', () => {
+    assert.deepEqual(resolveClaudeCommand('claude', 'linux'), { command: 'claude', shell: false });
+    assert.deepEqual(resolveClaudeCommand('C:/x/claude.exe', 'win32', {}), { command: 'C:/x/claude.exe', shell: false });
+    assert.deepEqual(resolveClaudeCommand('claude', 'win32', { PATH: '' }), { command: 'claude', shell: true });
   });
 
   it('summarizes stream-json output', () => {
