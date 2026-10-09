@@ -341,7 +341,8 @@ export function renderDeltaPrompt(req: MessagesRequest, fromIndex: number, opts:
     .filter((s) => s.trim());
   let text = parts.join('\n\n') || '(continue)';
   text += toolChoiceNote(req);
-  if (opts.reminderFooter && visibleTools(req.tools, opts).length && !isTextOnlyRequest(req)) text += `\n\n${REMINDER_FOOTER}`;
+  if (opts.reminderFooter && visibleTools(req.tools, opts).length && !isTextOnlyRequest(req) && req.tool_choice?.type !== 'none')
+    text += `\n\n${REMINDER_FOOTER}`;
   return { text, covered: req.messages.length };
 }
 

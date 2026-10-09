@@ -33,7 +33,7 @@ export function classifyRequest(req: MessagesRequest, backgroundModel: boolean, 
   if (isSafetyClassifierRequest(req)) return 'classifier';
   if (isWebSearchRequest(req)) return 'web_search';
   const clientTools = (req.tools ?? []).filter((t) => t.input_schema && !t.type);
-  if (clientTools.length === 0 || req.tool_choice?.type === 'none') return 'background';
+  if (clientTools.length === 0) return 'background';
   if (backgroundModel && clientTools.length === 0) return 'background';
   return 'main';
 }

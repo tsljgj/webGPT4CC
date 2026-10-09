@@ -118,6 +118,9 @@ describe('webgpt4cc MCP server', () => {
     assert.equal(echoed.apiKey, null, 'ANTHROPIC_API_KEY must not leak into the child');
     assert.deepEqual(echoed.args.slice(0, 4), ['-p', '--output-format', 'stream-json', '--verbose']);
     assert.ok(echoed.args.includes('Read,Edit'));
+    const settings = JSON.parse(echoed.args[echoed.args.indexOf('--settings') + 1]);
+    assert.equal(settings.env.ANTHROPIC_BASE_URL, bridge.url);
+    assert.equal(settings.disableAutoMode, 'disable');
     assert.ok(mcp.notifications.some((n) => n.method === 'notifications/progress' && n.params.progressToken === 'p1'));
   });
 

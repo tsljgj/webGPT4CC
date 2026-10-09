@@ -104,7 +104,8 @@ function mapProviderError(code: ProviderErrorCode, message: string, retryAfterMs
     case 'rate_limited':
       return new BridgeError('rate_limit_error', `ChatGPT usage limit: ${message}`, false, retryAfterMs);
     case 'too_long':
-      // Claude Code reacts to "prompt is too long" by compacting the conversation.
+      // Rewritten in handleMessages into Claude Code's "prompt is too long: N tokens > M maximum",
+      // which makes it compact the conversation.
       return new BridgeError('invalid_request_error', `prompt is too long: ${message}`, false);
     case 'not_logged_in':
       return new BridgeError('authentication_error', `ChatGPT is not logged in: ${message}`, false);
@@ -276,6 +277,14 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   }
   const { config, log } = state;
   const stream = req.stream === true;
+  const header = (name: string) => {
+    const v = httpReq.headers[name];
+    return typeof v === 'string' ? v : '';
+  };
+  // With CLAUDE_CODE_GATEWAY_HINT_HEADERS=1 (set by gptcc) Claude Code labels compaction requests.
+  if (header('x-claude-code-request-class') === 'compaction' || header('x-claude-code-compaction')) {
+    req = { ...req, tool_choice: { type: 'none' } };
+  }
   const resolved = resolveChatModel(req.model, config.models);
   const kind = classifyRequest(req, resolved.background, config);
   const inputTokens = estimateRequestTokens(req, config.render);
@@ -322,7 +331,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
 
   // 2. Deduplicate client retries of an identical request.
   const chatModel = resolved.slug;
-  const rHash = requestHash(req, chatModel);
+  const rHash = requestHash(req, chatModel, header('x-claude-code-session-id'));
   const cached = state.cache.get(rHash);
   if (cached) {
     const orphan = state.orphans.get(rHash);
@@ -466,6 +475,10 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
       log.info('turn cancelled');
       if (!res.writableEnded) res.end();
       return;
+    }
+    if (err.providerCode === 'too_long') {
+      const limit = Math.min(config.claudeContextWindow, Math.max(1000, inputTokens - 1));
+      err.message = `prompt is too long: ${inputTokens} tokens > ${limit} maximum (ChatGPT did not accept the message: ${err.message.replace(/^prompt is too long: /, '')})`;
     }
     log.error(`turn failed: ${err.message}`);
     if (writer && !writer.closed) writer.error(err.type, err.message);

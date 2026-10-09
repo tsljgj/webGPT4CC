@@ -50,6 +50,7 @@ const STRIPPED_ENV = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_CUSTOM_HEADERS',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_USE_BEDROCK',
@@ -65,28 +66,45 @@ const STRIPPED_ENV = [
   'CLAUDE_CODE_GZIP_REQUEST_BODIES',
 ];
 
-export function childEnv(settings, model, base = process.env) {
-  const env = { ...base };
-  for (const k of STRIPPED_ENV) delete env[k];
-  Object.assign(env, {
+/** Env that points a child `claude` at the bridge (kept in sync with bridge/src/launch.ts). */
+export function bridgeEnv(settings, model) {
+  return {
     ANTHROPIC_BASE_URL: settings.url,
+    // Always set a credential: without one, Claude Code would send the user's
+    // claude.ai OAuth token to ANTHROPIC_BASE_URL.
     ANTHROPIC_AUTH_TOKEN: settings.token || 'webgpt4cc',
     ANTHROPIC_MODEL: model,
     ANTHROPIC_DEFAULT_OPUS_MODEL: model,
     ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: model,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: settings.smallModel,
-    ANTHROPIC_SMALL_FAST_MODEL: settings.smallModel,
     CLAUDE_CODE_SUBAGENT_MODEL: model,
     API_TIMEOUT_MS: '3600000',
     CLAUDE_ENABLE_STREAM_WATCHDOG: '0',
     CLAUDE_STREAM_IDLE_TIMEOUT_MS: '1800000',
     CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: '3600000',
+    CLAUDE_CODE_MAX_RETRIES: '3',
     CLAUDE_CODE_MAX_CONTEXT_TOKENS: settings.contextWindow ?? '128000',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
+    CLAUDE_CODE_DISABLE_TERMINAL_TITLE: '1',
+    CLAUDE_CODE_AUTO_MODE_SERVER: '0',
+    CLAUDE_CODE_DISABLE_FAST_MODE: '1',
+    CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1',
+    CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
+    CLAUDE_CODE_GATEWAY_HINT_HEADERS: '1',
     DISABLE_PROMPT_CACHING: '1',
-  });
-  return env;
+  };
+}
+
+export function childEnv(settings, model, base = process.env, lite = false) {
+  const env = { ...base };
+  for (const k of STRIPPED_ENV) delete env[k];
+  const overrides = bridgeEnv(settings, model);
+  // --bare only reads ANTHROPIC_API_KEY (sent as x-api-key, which the bridge accepts).
+  if (lite) overrides.ANTHROPIC_API_KEY = overrides.ANTHROPIC_AUTH_TOKEN;
+  return { ...env, ...overrides };
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +142,11 @@ export const TOOLS = [
         timeout_minutes: { type: 'number', minimum: 1, description: 'Kill the delegate after this many minutes. Default 60.' },
         resume_session_id: { type: 'string', description: 'Continue a previous delegate session (from an earlier result).' },
         append_system_prompt: { type: 'string', description: 'Extra system instructions for the delegate.' },
+        lite: {
+          type: 'boolean',
+          description:
+            'Run the delegate in Claude Code\'s --bare mode: only Bash, Read and Edit tools, a minimal system prompt, no CLAUDE.md, hooks or plugins. Its first ChatGPT message is ~20x smaller, which suits small tasks and ChatGPT plans with small context windows.',
+        },
       },
       required: ['task'],
     },
@@ -211,8 +234,12 @@ function fmtDuration(ms) {
 }
 
 /** Build the `claude` argument list for a delegate run (the task itself goes to stdin). */
-export function delegateArgs(args, model) {
+export function delegateArgs(args, model, env) {
   const out = ['-p', '--output-format', 'stream-json', '--verbose', '--model', model];
+  // The --settings layer beats an `env` block in the user's ~/.claude/settings.json,
+  // which would otherwise silently route the delegate somewhere else.
+  if (env) out.push('--settings', JSON.stringify({ env, disableAutoMode: 'disable' }));
+  if (args.lite) out.push('--bare');
   const allowed = Array.isArray(args.allowed_tools) && args.allowed_tools.length ? args.allowed_tools : DEFAULT_ALLOWED_TOOLS;
   out.push('--allowedTools', allowed.map(String).join(','));
   out.push('--permission-mode', ['default', 'acceptEdits', 'plan'].includes(args.permission_mode) ? args.permission_mode : 'acceptEdits');
@@ -279,9 +306,11 @@ async function delegateTool(args, settings, ctx) {
   const timeoutMs = Math.max(1, Number(args.timeout_minutes) || 60) * 60_000;
   const started = Date.now();
   return await new Promise((resolvePromise) => {
-    const child = spawn(settings.claudeBin, delegateArgs(args, model), {
+    const env = childEnv(settings, model, process.env, !!args.lite);
+    const quote = (a) => (process.platform === 'win32' && /[\s"{}]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a);
+    const child = spawn(settings.claudeBin, delegateArgs(args, model, bridgeEnv(settings, model)).map(quote), {
       cwd,
-      env: childEnv(settings, model),
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
       windowsHide: true,

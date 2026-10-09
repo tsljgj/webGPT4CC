@@ -76,12 +76,12 @@ export function canonicalMessages(messages: MessageParam[]): unknown[] {
 }
 
 /**
- * Hash of a whole request, used to deduplicate client retries. Claude Code puts
- * its session id in metadata.user_id, which keeps two sessions that happen to
- * send the same request apart.
+ * Hash of a whole request, used to deduplicate client retries. Claude Code sends
+ * its session id (x-claude-code-session-id, also inside metadata.user_id), which
+ * keeps two sessions that happen to send the same request apart.
  */
-export function requestHash(req: MessagesRequest, chatModel: string): string {
-  const scope = typeof req.metadata?.user_id === 'string' ? req.metadata.user_id : '';
+export function requestHash(req: MessagesRequest, chatModel: string, sessionId = ''): string {
+  const scope = sessionId || (typeof req.metadata?.user_id === 'string' ? req.metadata.user_id : '');
   return sha(JSON.stringify([scope, contextHash(req, chatModel), canonicalMessages(req.messages)]));
 }
 

@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { type BridgeConfig, configPath, loadConfig } from './config.ts';
-import { bridgeUrl, childEnv, claudeArgs, claudeEnv, formatEnv } from './launch.ts';
+import { bridgeUrl, childEnv, claudeArgs, claudeEnv, formatEnv, withBareAuth } from './launch.ts';
 import { createLogger } from './log.ts';
 import { MockProvider } from './providers/mock.ts';
 import { createBridgeServer, createProvider } from './server.ts';
@@ -147,8 +147,11 @@ async function doctor(): Promise<number> {
 
 function runClaude(args: string[], flags: Record<string, string | boolean>): void {
   const config = loadConfig();
-  const env = childEnv(process.env, claudeEnv(config, typeof flags.model === 'string' ? flags.model : undefined));
-  const child = spawn('claude', claudeArgs(args), { stdio: 'inherit', env, shell: process.platform === 'win32' });
+  const bridgeEnv = withBareAuth(args, claudeEnv(config, typeof flags.model === 'string' ? flags.model : undefined));
+  const env = childEnv(process.env, bridgeEnv);
+  // On Windows `claude` is a .cmd shim that needs a shell; quote the JSON settings for cmd.exe.
+  const finalArgs = claudeArgs(args, bridgeEnv).map((a) => (process.platform === 'win32' && /[\s"{}]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a));
+  const child = spawn('claude', finalArgs, { stdio: 'inherit', env, shell: process.platform === 'win32' });
   child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
   child.on('error', (e) => {
     console.error(`could not start claude: ${e.message}`);

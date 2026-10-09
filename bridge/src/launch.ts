@@ -11,6 +11,7 @@ export const STRIPPED_ENV = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_CUSTOM_HEADERS',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_USE_BEDROCK',
@@ -38,12 +39,14 @@ export function claudeEnv(config: BridgeConfig, model?: string): Record<string, 
   const small = config.models.background || main;
   const env: Record<string, string> = {
     ANTHROPIC_BASE_URL: bridgeUrl(config),
+    // Always set a credential: without one, Claude Code would send the user's
+    // claude.ai OAuth token to ANTHROPIC_BASE_URL.
     ANTHROPIC_AUTH_TOKEN: config.authToken || 'webgpt4cc',
     ANTHROPIC_MODEL: main,
     ANTHROPIC_DEFAULT_OPUS_MODEL: main,
     ANTHROPIC_DEFAULT_SONNET_MODEL: main,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: main,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: small,
-    ANTHROPIC_SMALL_FAST_MODEL: small,
     CLAUDE_CODE_SUBAGENT_MODEL: main,
     // ChatGPT replies (especially thinking models) can take many minutes, with long
     // silent stretches while the model thinks: relax Claude Code's timeouts and
@@ -52,26 +55,60 @@ export function claudeEnv(config: BridgeConfig, model?: string): Record<string, 
     CLAUDE_ENABLE_STREAM_WATCHDOG: '0',
     CLAUDE_STREAM_IDLE_TIMEOUT_MS: '1800000',
     CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: '3600000',
+    // Failed turns are retried by the bridge's own logic; identical retries are deduplicated.
+    CLAUDE_CODE_MAX_RETRIES: '3',
     // "chatgpt-web" is unknown to Claude Code; tell it the window to compact against.
     CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(config.claudeContextWindow),
+    // No telemetry/bootstrap calls to Anthropic, no extra model calls that would each
+    // cost a ChatGPT message (prompt suggestions, terminal titles, auto-mode server).
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-    // Smaller requests (no safeguards/context_management fields); nothing the bridge needs.
+    CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
+    CLAUDE_CODE_DISABLE_TERMINAL_TITLE: '1',
+    CLAUDE_CODE_AUTO_MODE_SERVER: '0',
+    CLAUDE_CODE_DISABLE_FAST_MODE: '1',
+    CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1',
+    // Smaller requests (no billing header block, safeguards or context_management).
+    CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
+    // Lets the bridge recognise main/subagent/compaction/auxiliary requests.
+    CLAUDE_CODE_GATEWAY_HINT_HEADERS: '1',
     DISABLE_PROMPT_CACHING: '1',
   };
   return env;
 }
 
+/**
+ * A settings layer for `--settings`. Claude Code applies the `env` block of the
+ * user's ~/.claude/settings.json over the shell environment, so a user who once
+ * configured another gateway there would silently bypass the bridge; the
+ * --settings flag layer wins over user and project settings.
+ */
+export function claudeSettings(env: Record<string, string>): string {
+  return JSON.stringify({ env, disableAutoMode: 'disable' });
+}
+
 const PERMISSION_FLAGS = ['--permission-mode', '--dangerously-skip-permissions', '--allow-dangerously-skip-permissions'];
 
+function hasFlag(args: string[], flags: string[]): boolean {
+  return args.some((a) => flags.some((f) => a === f || a.startsWith(`${f}=`)));
+}
+
 /**
- * Claude Code defaults to "auto" permission mode, whose safety classifier makes two
- * very large extra model calls per tool use. That does not work through ChatGPT, so
- * unless the user chose a mode, start in "default" (ask before acting).
+ * Arguments for `claude`:
+ * - unless the user chose a permission mode, start in "default" (Claude Code's
+ *   "auto" mode runs a safety classifier with two very large extra model calls
+ *   per tool use, which cannot work through ChatGPT);
+ * - add the bridge settings layer, unless the user passes their own --settings.
  */
-export function claudeArgs(args: string[]): string[] {
-  const chosen = args.some((a) => PERMISSION_FLAGS.some((f) => a === f || a.startsWith(`${f}=`)));
-  return chosen ? args : ['--permission-mode', 'default', ...args];
+export function claudeArgs(args: string[], env?: Record<string, string>): string[] {
+  const out = hasFlag(args, PERMISSION_FLAGS) ? [...args] : ['--permission-mode', 'default', ...args];
+  if (env && !hasFlag(args, ['--settings'])) out.unshift('--settings', claudeSettings(env));
+  return out;
+}
+
+/** `--bare` mode only reads ANTHROPIC_API_KEY (sent as x-api-key, which the bridge accepts). */
+export function withBareAuth(args: string[], env: Record<string, string>): Record<string, string> {
+  return args.includes('--bare') ? { ...env, ANTHROPIC_API_KEY: env.ANTHROPIC_AUTH_TOKEN ?? '' } : env;
 }
 
 export function childEnv(base: NodeJS.ProcessEnv, overrides: Record<string, string>): NodeJS.ProcessEnv {
