@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -75,6 +75,7 @@ describe('webgpt4cc MCP server', () => {
   after(() => {
     mcp.close();
     bridge.server.close();
+    rmSync(home, { recursive: true, force: true });
   });
 
   it('initializes and lists tools', async () => {
