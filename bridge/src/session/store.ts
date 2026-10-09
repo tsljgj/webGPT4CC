@@ -75,9 +75,14 @@ export function canonicalMessages(messages: MessageParam[]): unknown[] {
   });
 }
 
-/** Hash of a whole request, used to deduplicate client retries. */
+/**
+ * Hash of a whole request, used to deduplicate client retries. Claude Code puts
+ * its session id in metadata.user_id, which keeps two sessions that happen to
+ * send the same request apart.
+ */
 export function requestHash(req: MessagesRequest, chatModel: string): string {
-  return sha(JSON.stringify([contextHash(req, chatModel), canonicalMessages(req.messages)]));
+  const scope = typeof req.metadata?.user_id === 'string' ? req.metadata.user_id : '';
+  return sha(JSON.stringify([scope, contextHash(req, chatModel), canonicalMessages(req.messages)]));
 }
 
 export interface TurnRecord {
@@ -149,19 +154,27 @@ export class SessionStore {
   }
 }
 
-/** Short-lived cache of finished/in-flight responses keyed by request hash (client retries). */
+/**
+ * Cache of in-flight and recently finished responses keyed by request hash, so
+ * a client retry of an identical request does not cost another ChatGPT turn.
+ * Entries live while in flight and for `ttlMs` after they settle.
+ */
 export class ResponseCache<T> {
-  private readonly entries = new Map<string, { value: Promise<T>; at: number }>();
+  private readonly entries = new Map<string, { value: Promise<T>; settledAt?: number }>();
   private readonly ttlMs: number;
 
-  constructor(ttlMs = 10 * 60_000) {
+  constructor(ttlMs = 3 * 60_000) {
     this.ttlMs = ttlMs;
+  }
+
+  private expired(e: { settledAt?: number }): boolean {
+    return e.settledAt !== undefined && Date.now() - e.settledAt > this.ttlMs;
   }
 
   get(key: string): Promise<T> | undefined {
     const e = this.entries.get(key);
     if (!e) return undefined;
-    if (Date.now() - e.at > this.ttlMs) {
+    if (this.expired(e)) {
       this.entries.delete(key);
       return undefined;
     }
@@ -169,10 +182,16 @@ export class ResponseCache<T> {
   }
 
   set(key: string, value: Promise<T>): void {
-    this.entries.set(key, { value, at: Date.now() });
-    // Failed generations must not be replayed to retries.
-    value.catch(() => this.entries.delete(key));
-    for (const [k, e] of this.entries) if (Date.now() - e.at > this.ttlMs) this.entries.delete(k);
+    const entry: { value: Promise<T>; settledAt?: number } = { value };
+    this.entries.set(key, entry);
+    value.then(
+      () => (entry.settledAt = Date.now()),
+      // Failed generations must not be replayed to retries.
+      () => {
+        if (this.entries.get(key) === entry) this.entries.delete(key);
+      },
+    );
+    for (const [k, e] of this.entries) if (this.expired(e)) this.entries.delete(k);
   }
 
   delete(key: string): void {

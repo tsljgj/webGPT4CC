@@ -225,6 +225,7 @@ function readValue(
     const j = skipWs(text, i);
     if (j >= text.length) return true;
     if (text.startsWith(TOOL_CLOSE, j)) return true;
+    if (text.startsWith('<tool_call', j) && (j === 0 || text[j - 1] === '\n' || /\n[ \t]*$/.test(text.slice(Math.max(0, j - 40), j)))) return true;
     if (paramTag) return PARAM_OPEN_RE.test(text.slice(j, j + 200));
     return /^<[A-Za-z_][\w.-]*>/.test(text.slice(j, j + 200));
   };
