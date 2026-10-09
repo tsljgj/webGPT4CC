@@ -8,6 +8,13 @@ function typesOf(schema: JSONSchema | undefined): string[] {
   if (typeof schema.type === 'string') return [schema.type];
   const alts = schema.anyOf ?? schema.oneOf;
   if (alts) return [...new Set(alts.flatMap(typesOf))];
+  if (schema.allOf) {
+    // Intersection: the first member that names a type decides.
+    for (const part of schema.allOf) {
+      const t = typesOf(part);
+      if (t.length) return t;
+    }
+  }
   if (schema.enum) return [...new Set(schema.enum.map((v) => (v === null ? 'null' : typeof v)))];
   if (schema.const !== undefined) return [schema.const === null ? 'null' : typeof schema.const];
   if (schema.properties) return ['object'];
@@ -18,7 +25,12 @@ function typesOf(schema: JSONSchema | undefined): string[] {
 /** True when the value should be passed through as a raw (unescaped) string. */
 export function isStringSchema(schema: JSONSchema | undefined): boolean {
   const t = typesOf(schema).filter((x) => x !== 'null');
-  return t.length === 0 || (t.length === 1 && t[0] === 'string');
+  return t.length === 1 && t[0] === 'string';
+}
+
+/** True when the schema says nothing about the type ({}, $ref we don't resolve, ...). */
+function isUntyped(schema: JSONSchema | undefined): boolean {
+  return typesOf(schema).length === 0;
 }
 
 /** Render a schema as a compact TypeScript-like type, e.g. `array<{path: string, line?: number}>`. */
@@ -105,9 +117,17 @@ export function lenientJsonParse(text: string): { ok: true; value: unknown } | {
  * Claude Code's own input validation reports the problem back to the model.
  */
 export function coerceValue(raw: string, schema: JSONSchema | undefined): unknown {
-  if (isStringSchema(schema)) return raw;
   const types = typesOf(schema);
   const trimmed = raw.trim();
+  if (isStringSchema(schema)) return types.includes('null') && trimmed === 'null' ? null : raw;
+  if (isUntyped(schema)) {
+    // Unknown type: take JSON when the value clearly is JSON, otherwise the raw string.
+    if (/^[[{]/.test(trimmed) || /^(true|false|null|-?\d+(\.\d+)?([eE][+-]?\d+)?)$/.test(trimmed)) {
+      const parsed = lenientJsonParse(trimmed);
+      if (parsed.ok) return parsed.value;
+    }
+    return raw;
+  }
   const parsed = lenientJsonParse(trimmed);
   if (parsed.ok) {
     const v = parsed.value;

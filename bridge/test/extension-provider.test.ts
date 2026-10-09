@@ -19,6 +19,7 @@ class FakeExtension {
   ws!: WebSocket;
   readonly received: Array<Record<string, unknown>> = [];
   onJob: (job: Record<string, unknown>, send: (ev: ChatEvent) => void) => void = () => {};
+  ackCancel = true;
 
   async connect(url: string, opts: { origin?: string; token?: string } = {}): Promise<number | 'open'> {
     return new Promise((resolve) => {
@@ -29,6 +30,10 @@ class FakeExtension {
       this.ws.on('message', (data) => {
         const msg = JSON.parse(String(data)) as Record<string, unknown>;
         this.received.push(msg);
+        if (msg.type === 'cancel' && this.ackCancel) {
+          // Like the real extension: stop, then report the job's end.
+          this.send({ type: 'job_event', jobId: msg.jobId, event: { type: 'error', code: 'aborted', message: 'stopped' } });
+        }
         if (msg.type === 'job') {
           const j = msg.job as Record<string, unknown>;
           this.onJob(j, (ev) => this.send({ type: 'job_event', jobId: j.id, event: ev }));
@@ -175,6 +180,7 @@ describe('extension provider', () => {
     assert.equal((events.at(-1) as { code: string }).code, 'aborted');
     await wait(50);
     assert.ok(ext.received.some((m) => m.type === 'cancel'));
+    // Freed once the extension confirms the stop.
     assert.equal(provider.status().workers[0]!.busy, false);
     ext.close();
     await wait(50);
@@ -202,6 +208,40 @@ describe('extension provider', () => {
     const err = events.at(-1) as { type: string; code: string };
     assert.equal(err.type, 'error');
     assert.equal(err.code, 'ui_error');
+  });
+});
+
+describe('extension provider cancellation', () => {
+  it('keeps a cancelled tab reserved until the extension confirms', async () => {
+    const config: BridgeConfig = { ...defaultConfig(), port: 0, extensionToken: EXT_TOKEN };
+    const provider = new ExtensionProvider({ extensionToken: EXT_TOKEN, allowedOrigins: [], newChatUrl: config.newChatUrl, workerWaitMs: 2000, bridgeVersion: 't', log: silentLogger });
+    const bridge = createBridgeServer(config, silentLogger, provider);
+    await bridge.listen();
+    try {
+      const ext = new FakeExtension();
+      ext.ackCancel = false;
+      await ext.connect(bridge.url());
+      const started: string[] = [];
+      ext.onJob = (j) => started.push(String(j.id));
+      ext.workers([{ id: 'w' }]);
+      await wait(50);
+      const ac = new AbortController();
+      const first = collect(provider.run(job(), ac.signal));
+      await wait(50);
+      ac.abort();
+      await first;
+      const second = collect(provider.run(job(), new AbortController().signal));
+      await wait(150);
+      assert.equal(started.length, 1, 'second job must wait while the tab is stopping');
+      ext.send({ type: 'job_event', jobId: started[0], event: { type: 'error', code: 'aborted', message: 'stopped' } });
+      await wait(150);
+      assert.equal(started.length, 2);
+      ext.send({ type: 'job_event', jobId: started[1], event: { type: 'done', text: 'ok', conversationId: 'c' } });
+      await second;
+      ext.close();
+    } finally {
+      await bridge.close();
+    }
   });
 });
 

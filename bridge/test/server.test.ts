@@ -519,3 +519,55 @@ describe('local answers and output-limit handling', () => {
     }
   });
 });
+
+describe('interruptions and concurrency', () => {
+  it('tells ChatGPT its reply was discarded when the user interrupts and sends a new message', async () => {
+    const config: BridgeConfig = { ...defaultConfig(), port: 0, authToken: TOKEN, provider: 'mock', orphanGraceMs: 60_000 };
+    let turn = 0;
+    const mock = new MockProvider({
+      chunkSize: 4,
+      chunkDelayMs: 25,
+      script: () => (turn++ === 0 ? '<tool_call name="Bash">\n<param name="command">ls</param>\n</tool_call>' : 'a long answer that the user interrupts midway'),
+    });
+    const bridge = createBridgeServer(config, silentLogger, mock);
+    await bridge.listen();
+    const hdr = { 'x-claude-code-session-id': 'S1' };
+    try {
+      const base = { model: 'm', max_tokens: 100, stream: true, tools: TOOLS, messages: [{ role: 'user', content: 'start' }] };
+      const r1 = assemble(parseSse(await (await post(bridge.url(), '/v1/messages', base, hdr)).text()));
+      const tu = r1.content.find((b) => b.type === 'tool_use')!;
+      const follow = { ...base, messages: [...base.messages, { role: 'assistant', content: r1.content }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: tu.id, content: 'a' }] }] };
+      // Second turn: the client goes away mid-reply (Esc).
+      const ac = new AbortController();
+      const p = fetch(bridge.url() + '/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}`, ...hdr },
+        body: JSON.stringify(follow),
+        signal: ac.signal,
+      }).then((r) => r.text()).catch(() => null);
+      await new Promise((r) => setTimeout(r, 120));
+      ac.abort();
+      await p;
+      // Third request: same transcript plus a new user message.
+      const third = { ...follow, messages: [...follow.messages.slice(0, -1), { role: 'user', content: [{ type: 'tool_result', tool_use_id: tu.id, content: 'a' }, { type: 'text', text: 'actually, stop' }] }] };
+      await (await post(bridge.url(), '/v1/messages', third, hdr)).text();
+      const last = mock.jobs.at(-1)!;
+      assert.equal(last.conversation.kind, 'continue');
+      assert.match(last.prompt, /your previous reply was interrupted/);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('does not extract tool calls from replies to tool-less requests', async () => {
+    const ctx = await start(() => 'Summary.\n<tool_call name="Bash">\n<param name="command">ls</param>\n</tool_call>');
+    try {
+      const r = await post(ctx.url, '/v1/messages', { model: 'm', max_tokens: 100, messages: [{ role: 'user', content: 'summarize' }] });
+      const j = (await r.json()) as { stop_reason: string; content: Array<{ type: string }> };
+      assert.equal(j.stop_reason, 'end_turn');
+      assert.deepEqual(j.content.map((b) => b.type), ['text']);
+    } finally {
+      await ctx.bridge.close();
+    }
+  });
+});

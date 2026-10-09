@@ -22,10 +22,16 @@ function normText(s: string): string {
 }
 
 /** Fingerprint of an assistant message, stable across Claude Code's re-serialization. */
-export function assistantFingerprint(content: MessageParam['content'] | ResponseBlock[]): string {
+export function assistantFingerprint(content: MessageParam['content'] | ResponseBlock[], scope = ''): string {
   const blocks: ContentBlock[] = typeof content === 'string' ? [{ type: 'text', text: content }] : (content as ContentBlock[]);
   const ids = blocks.filter((b) => b.type === 'tool_use').map((b) => (b as ToolUseBlock).id);
+  // tool_use ids are unique; a text-only reply ("Done.") is only unique within a session.
   if (ids.length) return sha(`tools:${ids.join(',')}`);
+  if (scope) return sha(`text:${scope}:${blocks
+    .filter((b) => b.type === 'text')
+    .map((b) => normText((b as TextBlock).text))
+    .filter(Boolean)
+    .join(' ')}`);
   const text = blocks
     .filter((b) => b.type === 'text')
     .map((b) => normText((b as TextBlock).text))

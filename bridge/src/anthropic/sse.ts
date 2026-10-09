@@ -117,6 +117,12 @@ export class SseMessageWriter {
     this.event('ping', { type: 'ping' });
   }
 
+  /** Stop the keep-alive timer (the client went away). */
+  dispose(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = undefined;
+  }
+
   /**
    * Append to a thinking block (ChatGPT's reasoning summary). Only allowed before
    * any text or tool block; it is closed with a placeholder signature as soon as

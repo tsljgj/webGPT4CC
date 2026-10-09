@@ -37,8 +37,11 @@ export interface ParseResult {
   warnings: string[];
 }
 
-const OPEN_RE = /^[ \t]*<tool_call\b([^>\n]*)>/gm;
-const FENCE_LINE_RE = /^[ \t]*(```|~~~)[\w+-]*[ \t]*$/;
+// At most 3 spaces of indentation: 4+ spaces (or a tab) is a markdown code block, i.e. an example.
+const OPEN_RE = /^ {0,3}<tool_call\b([^>\n]*)>/gm;
+const FENCE_LINE_RE = /^ {0,3}(```+|~~~+)[\w+-]*[ \t]*$/;
+/** A made-up tool result written by the model (it must stop after its calls instead). */
+const FAKE_RESULT_RE = /^ {0,3}<(tool_result|tool_results|function_results)\b/m;
 const TOOL_CLOSE = '</tool_call>';
 
 function attr(attrs: string, key: string): string | undefined {
@@ -60,20 +63,29 @@ function skipWs(text: string, i: number): number {
   return i;
 }
 
-/** Remove a trailing code-fence opener line (it wrapped the following tool call). */
-function stripTrailingFenceOpener(s: string): string {
-  const lines = s.replace(/\s+$/, '').split('\n');
-  if (lines.length && FENCE_LINE_RE.test(lines[lines.length - 1]!)) {
-    lines.pop();
-    return lines.join('\n');
-  }
-  return s;
+function trimEndLinear(s: string): string {
+  return s.trimEnd();
 }
 
-/** Remove a leading code-fence closer line (it closed the preceding tool call's wrapper). */
-function stripLeadingFenceCloser(s: string): string {
-  const m = /^\s*\n?[ \t]*(```|~~~)[ \t]*(\n|$)/.exec(s);
-  return m ? s.slice(m[0].length) : s;
+/** Number of fence lines (``` or ~~~) in `s`. */
+function countFences(s: string): number {
+  let n = 0;
+  for (const line of s.split('\n')) if (FENCE_LINE_RE.test(line)) n++;
+  return n;
+}
+
+/** If the last non-blank line of `s` is a fence line, return `s` without it. */
+function withoutTrailingFenceLine(s: string): string | null {
+  const t = trimEndLinear(s);
+  const nl = t.lastIndexOf('\n');
+  return FENCE_LINE_RE.test(t.slice(nl + 1)) ? t.slice(0, nl + 1) : null;
+}
+
+/** If the first non-blank line of `s` is a fence line, return `s` after it. */
+function withoutLeadingFenceLine(s: string): string | null {
+  const m = /^\s*?\n?( {0,3}(```+|~~~+)[ \t]*)(\n|$)/.exec(s);
+  if (!m || s.slice(0, m.index).trim()) return null;
+  return s.slice(m[0].length);
 }
 
 export function resolveToolName(name: string, tools: ToolDefinition[]): string {
@@ -97,7 +109,7 @@ interface CallParse {
 const PARAM_OPEN_RE = /^<(param|parameter|arg)\b([^>\n]*)>/;
 
 /** String params that hold an entire file; a block-formatted value keeps its trailing newline. */
-const WHOLE_FILE_PARAMS = new Set(['content', 'new_source']);
+const WHOLE_FILE_PARAMS = new Set(['content']);
 
 function parseCall(text: string, openStart: number, openEnd: number, attrs: string, tools: ToolDefinition[]): CallParse {
   const warnings: string[] = [];
@@ -152,7 +164,10 @@ function parseCall(text: string, openStart: number, openEnd: number, attrs: stri
       if (parsed.ok && parsed.value && typeof parsed.value === 'object' && !Array.isArray(parsed.value)) {
         const obj = parsed.value as Record<string, unknown>;
         const args = obj.arguments ?? obj.input ?? obj.parameters ?? obj.args;
-        if (typeof obj.name === 'string' && (args === undefined || (args && typeof args === 'object'))) {
+        if (name && args === undefined) {
+          // <tool_call name="X">{...}</tool_call>: the object is the arguments (it may have its own "name").
+          Object.assign(json, obj);
+        } else if (typeof obj.name === 'string' && (args === undefined || (args && typeof args === 'object'))) {
           if (!name) name = obj.name;
           Object.assign(json, (args as Record<string, unknown>) ?? {});
         } else if (typeof obj.name === 'string' && typeof args === 'string') {
@@ -219,17 +234,6 @@ function readValue(
   paramTag: string | null,
 ): { value: string; next: number; warning?: string; block?: boolean } {
   const block = text[start] === '\n' || (text[start] === '\r' && text[start + 1] === '\n');
-  // CDATA form.
-  const afterWs = start + (/^\r?\n?[ \t]*/.exec(text.slice(start, start + 20))?.[0].length ?? 0);
-  if (text.startsWith('<![CDATA[', afterWs)) {
-    const cdEnd = text.indexOf(']]>', afterWs + 9);
-    if (cdEnd !== -1) {
-      const value = text.slice(afterWs + 9, cdEnd);
-      let next = skipWs(text, cdEnd + 3);
-      if (text.startsWith(close, next)) next += close.length;
-      return { value, next };
-    }
-  }
   const followerOk = (i: number): boolean => {
     const j = skipWs(text, i);
     if (j >= text.length) return true;
@@ -238,6 +242,22 @@ function readValue(
     if (paramTag) return PARAM_OPEN_RE.test(text.slice(j, j + 200));
     return /^<[A-Za-z_][\w.-]*>/.test(text.slice(j, j + 200));
   };
+  // CDATA form: the value ends at a "]]>" that is directly followed by the closing tag and then by
+  // another parameter or the end of the call (so content that itself mentions "]]>" survives).
+  const afterWs = start + (/^\r?\n?[ \t]*/.exec(text.slice(start, start + 20))?.[0].length ?? 0);
+  if (text.startsWith('<![CDATA[', afterWs)) {
+    let from = afterWs + 9;
+    for (;;) {
+      const cdEnd = text.indexOf(']]>', from);
+      if (cdEnd === -1) break;
+      const j = skipWs(text, cdEnd + 3);
+      if (text.startsWith(close, j) && followerOk(j + close.length)) {
+        return { value: stripOneNewlineEachSide(text.slice(afterWs + 9, cdEnd)), next: j + close.length };
+      }
+      from = cdEnd + 3;
+    }
+    // Not a well-formed CDATA value: fall through and read it raw.
+  }
   let from = start;
   let first = -1;
   for (;;) {
@@ -263,38 +283,109 @@ function readValue(
   return { value: stripOneNewlineEachSide(text.slice(start, stop)), next: stop, block, warning: `missing ${close}` };
 }
 
-export function parseReply(rawText: string, tools: ToolDefinition[] = []): ParseResult {
+export interface ParseOptions {
+  /** false = the request had no tools: treat the whole reply as text. */
+  toolCalls?: boolean;
+}
+
+type Segment = { kind: 'text'; text: string } | { kind: 'call'; call: CallParse };
+
+export function parseReply(rawText: string, tools: ToolDefinition[] = [], opts: ParseOptions = {}): ParseResult {
   const text = rawText.replace(/\r\n/g, '\n');
-  const blocks: ParsedBlock[] = [];
   const warnings: string[] = [];
-  let cursor = 0;
+  if (opts.toolCalls === false) {
+    const t = trimEndLinear(text);
+    return { blocks: t ? [{ type: 'text', text: t }] : [], toolCalls: 0, trailingText: '', warnings };
+  }
+  const segments: Segment[] = [];
+  let cursor = 0; // end of the last consumed call
+  let search = 0; // where to look for the next <tool_call
+  let fenceParity = 0; // fence lines seen in plain text so far (odd = inside a code block)
+  let wrapper: { start: number; segIndex: number } | null = null; // open fence that wraps calls
   let calls = 0;
-  let trailingText = '';
-  OPEN_RE.lastIndex = 0;
+  let stopped = false;
   for (;;) {
-    OPEN_RE.lastIndex = cursor;
+    OPEN_RE.lastIndex = search;
     const m = OPEN_RE.exec(text);
     if (!m) break;
+    let before = text.slice(cursor, m.index);
+    // A made-up result between calls: the model kept going on imagined output. Run nothing after it.
+    if (calls > 0 && FAKE_RESULT_RE.test(before)) {
+      warnings.push('the reply contains a made-up <tool_result> after a tool call; calls after it were dropped');
+      stopped = true;
+      break;
+    }
+    if (wrapper) {
+      const after = withoutLeadingFenceLine(before);
+      if (after !== null) {
+        before = after;
+        wrapper = null;
+      }
+    }
+    const parity = (fenceParity + countFences(before)) % 2;
+    if (!wrapper && parity === 1) {
+      const opened = withoutTrailingFenceLine(before);
+      if (opened === null) {
+        // The call sits inside a code block that holds other content: it is an example, not a call.
+        search = m.index + m[0].length;
+        continue;
+      }
+      // A fence directly wrapping the call (models sometimes do this despite the rules).
+      if (opened.trim()) segments.push({ kind: 'text', text: calls === 0 ? trimEndLinear(opened) : opened.trim() });
+      wrapper = { start: cursor + opened.length, segIndex: segments.length };
+      fenceParity = 0;
+    } else {
+      fenceParity = wrapper ? 0 : parity;
+      if (before.trim()) segments.push({ kind: 'text', text: calls === 0 ? trimEndLinear(before) : before.trim() });
+    }
     const openStart = m.index + m[0].indexOf('<');
     const openEnd = m.index + m[0].length;
-    let before = text.slice(cursor, m.index);
-    if (calls > 0) before = stripLeadingFenceCloser(before);
-    before = stripTrailingFenceOpener(before);
-    if (before.trim()) blocks.push({ type: 'text', text: calls === 0 ? before.replace(/\s+$/, '') : before.trim() });
     const call = parseCall(text, openStart, openEnd, m[1] ?? '', tools);
-    warnings.push(...call.warnings);
-    blocks.push(call.incomplete ? { type: 'tool_use', name: call.name, input: call.input, incomplete: true } : { type: 'tool_use', name: call.name, input: call.input });
+    segments.push({ kind: 'call', call });
     calls++;
     cursor = Math.max(call.end, openEnd);
+    search = cursor;
   }
-  if (calls === 0) {
-    const t = text.replace(/\s+$/, '');
-    if (t) blocks.push({ type: 'text', text: t });
-  } else {
-    trailingText = stripLeadingFenceCloser(text.slice(cursor)).trim();
+  let trailingText = '';
+  if (calls > 0) {
+    let rest = text.slice(cursor);
+    if (wrapper && !stopped) {
+      const after = withoutLeadingFenceLine(rest);
+      if (after !== null && after.trim() && !FAKE_RESULT_RE.test(after)) {
+        // Fenced calls followed by explanation: the model was showing an example, not acting.
+        warnings.push('tool calls inside a code block followed by prose were treated as an example and not run');
+        const exampleText = trimEndLinear(text.slice(wrapper.start));
+        const kept = segments.slice(0, wrapper.segIndex);
+        segments.length = 0;
+        segments.push(...kept);
+        const prev = segments[segments.length - 1];
+        if (prev?.kind === 'text') prev.text = trimEndLinear(`${prev.text}\n${exampleText}`);
+        else segments.push({ kind: 'text', text: exampleText });
+        rest = '';
+      } else if (after !== null) rest = after;
+    }
+    trailingText = rest.trim();
     if (trailingText) warnings.push(`dropped ${trailingText.length} chars of text after the last tool call`);
+  } else {
+    const t = trimEndLinear(text);
+    if (t) segments.push({ kind: 'text', text: t });
   }
-  return { blocks, toolCalls: calls, trailingText, warnings };
+  const blocks: ParsedBlock[] = [];
+  let toolCalls = 0;
+  for (const seg of segments) {
+    if (seg.kind === 'text') {
+      blocks.push({ type: 'text', text: seg.text });
+      continue;
+    }
+    warnings.push(...seg.call.warnings);
+    toolCalls++;
+    blocks.push(
+      seg.call.incomplete
+        ? { type: 'tool_use', name: seg.call.name, input: seg.call.input, incomplete: true }
+        : { type: 'tool_use', name: seg.call.name, input: seg.call.input },
+    );
+  }
+  return { blocks, toolCalls, trailingText, warnings };
 }
 
 /**
@@ -317,7 +408,7 @@ export function safeStreamPrefix(textSoFar: string): { safe: string; sawToolCall
     // A partial "<tool_call" at the start of the current incomplete line is already excluded.
   }
   // Hold back a trailing fence opener line (and any blank lines after it).
-  const trimmed = region.replace(/\s+$/, '');
+  const trimmed = trimEndLinear(region);
   const lastNl = trimmed.lastIndexOf('\n');
   const lastLine = trimmed.slice(lastNl + 1);
   if (FENCE_LINE_RE.test(lastLine)) {

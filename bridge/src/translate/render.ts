@@ -196,7 +196,8 @@ function toolUseIndex(messages: MessageParam[]): Map<string, { name: string; cal
 
 function renderValue(v: unknown): string {
   if (typeof v === 'string') {
-    if (v.includes('</param>') || v.includes('</tool_call>')) return `<![CDATA[${v}]]>`;
+    // One newline after "<![CDATA[" and one before "]]>" are stripped by the parser.
+    if (v.includes('</param>') || v.includes('</tool_call>')) return `<![CDATA[\n${v}\n]]>`;
     return v.includes('\n') ? `\n${v}\n` : v;
   }
   return JSON.stringify(v);
@@ -222,7 +223,15 @@ function renderToolResult(b: ToolResultBlock, ctx: RenderCtx): string {
   let body = textOf(b.content);
   const cap = Math.min(...[ctx.opts.maxToolResultChars, ctx.resultCap].filter((x) => x > 0), Infinity);
   if (Number.isFinite(cap)) body = truncate(body, cap, 'tool result');
-  return `<tool_result ${attrs.join(' ')}>\n${body}\n</tool_result>`;
+  return `<tool_result ${attrs.join(' ')}>\n${escapeClosers(body)}\n</tool_result>`;
+}
+
+/**
+ * File or web content inside a tool result must not be able to close the result (or a
+ * replayed message) and pose as user or harness text.
+ */
+function escapeClosers(s: string): string {
+  return s.includes('</') ? s.replace(/<\/(tool_result|message|harness_message)>/g, '<\\/$1>') : s;
 }
 
 /** Harness noise that means nothing to a ChatGPT model (Claude's own token budget). */
@@ -243,9 +252,16 @@ export function renderMessageBody(m: MessageParam | { role: string; content: Mes
         if (t.trim()) out.push(t);
         break;
       }
-      case 'tool_use':
-        out.push(renderToolCall((b as ToolUseBlock).name, (b as ToolUseBlock).input));
+      case 'tool_use': {
+        const tu = b as ToolUseBlock;
+        // When history must shrink, long inputs (e.g. a Write of a whole file) are shortened too.
+        const input =
+          ctx.resultCap > 0
+            ? Object.fromEntries(Object.entries(tu.input ?? {}).map(([k, v]) => [k, typeof v === 'string' ? truncate(v, ctx.resultCap, 'value') : v]))
+            : tu.input;
+        out.push(renderToolCall(tu.name, input));
         break;
+      }
       case 'tool_result':
         out.push(renderToolResult(b as ToolResultBlock, ctx));
         break;
@@ -354,7 +370,10 @@ function renderHistory(history: MessageParam[], index: RenderCtx['index'], opts:
     tail.unshift(parts[i]!);
   }
   const omitted = parts.length - 1 - tail.length;
-  if (budget <= used - tail.reduce((a, x) => a + x.length + 2, 0)) return `${HISTORY_INTRO}\n\n${marker(history.length)}`;
+  if (budget < HISTORY_INTRO.length + 2000) {
+    // Not even room for the task: keep a short excerpt of it anyway (the prompt may exceed the cap).
+    return [HISTORY_INTRO, `${parts[0]!.slice(0, 1500)}\n[... truncated ...]\n</message>`, marker(history.length - 1)].join('\n\n');
+  }
   return [HISTORY_INTRO, first, ...(omitted ? [marker(omitted)] : []), ...tail].join('\n\n');
 }
 

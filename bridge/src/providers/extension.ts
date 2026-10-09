@@ -128,7 +128,12 @@ export class ExtensionProvider implements ChatProvider {
       }
       case 'job_event': {
         const a = this.jobs.get(String(msg.jobId));
-        if (!a || a.conn !== conn) return;
+        if (!a || a.conn !== conn) {
+          // The final event of a job we cancelled: its tab is free again.
+          const ev = msg.event as ChatEvent | undefined;
+          if (ev && (ev.type === 'done' || ev.type === 'error')) this.releaseCancelled(String(msg.jobId));
+          return;
+        }
         const ev = msg.event as ChatEvent;
         if (!ev || typeof ev !== 'object') return;
         if (ev.type === 'done') a.queue.push({ ...ev, workerId: a.workerKey });
@@ -147,13 +152,29 @@ export class ExtensionProvider implements ChatProvider {
     }
   }
 
-  private finishJob(jobId: string): void {
+  private finishJob(jobId: string, opts: { cancelled?: boolean } = {}): void {
     const a = this.jobs.get(jobId);
     if (!a) return;
     this.jobs.delete(jobId);
-    if (this.busy.get(a.workerKey) === jobId) this.busy.delete(a.workerKey);
+    if (this.busy.get(a.workerKey) === jobId) {
+      if (opts.cancelled) {
+        // The tab is still stopping the generation: keep it reserved until the extension
+        // reports the job's end (or a safety timeout), so the next job doesn't race it.
+        this.busy.set(a.workerKey, `cancel:${jobId}`);
+        const t = setTimeout(() => this.releaseCancelled(jobId), 20_000);
+        t.unref?.();
+      } else this.busy.delete(a.workerKey);
+    }
     a.queue.close();
     this.dispatch();
+  }
+
+  private releaseCancelled(jobId: string): void {
+    for (const [key, v] of this.busy)
+      if (v === `cancel:${jobId}`) {
+        this.busy.delete(key);
+        this.dispatch();
+      }
   }
 
   private send(conn: Connection, msg: unknown): void {
@@ -181,7 +202,8 @@ export class ExtensionProvider implements ChatProvider {
     for (const conn of this.conns.values())
       for (const info of conn.workers.values()) {
         const key = `${conn.id}:${info.id}`;
-        if (info.ready && !this.busy.has(key)) out.push({ conn, workerKey: key, info });
+        // `info.busy`: the extension's own view (e.g. still stopping a cancelled reply).
+        if (info.ready && !info.busy && !this.busy.has(key)) out.push({ conn, workerKey: key, info });
       }
     return out;
   }
@@ -241,8 +263,7 @@ export class ExtensionProvider implements ChatProvider {
   }
 
   async *run(job: ChatJob, signal: AbortSignal): AsyncIterable<ChatEvent> {
-    const deadline = Date.now() + job.timeoutMs;
-    // 1. Wait for a worker.
+    // 1. Wait for a worker (queue time does not count against the job timeout).
     if (this.workerCount() === 0) yield { type: 'status', status: 'waiting_for_worker' };
     let assigned: { conn: Connection; workerKey: string } | undefined;
     try {
@@ -265,14 +286,14 @@ export class ExtensionProvider implements ChatProvider {
     const onAbort = () => {
       this.send(conn, { type: 'cancel', jobId: job.id });
       queue.push({ type: 'error', code: 'aborted', message: 'request cancelled by the client' });
-      this.finishJob(job.id);
+      this.finishJob(job.id, { cancelled: true });
     };
     signal.addEventListener('abort', onAbort, { once: true });
     const timer = setTimeout(() => {
       this.send(conn, { type: 'cancel', jobId: job.id });
       queue.push({ type: 'error', code: 'timeout', message: `no reply within ${Math.round(job.timeoutMs / 1000)}s` });
-      this.finishJob(job.id);
-    }, Math.max(1000, deadline - Date.now()));
+      this.finishJob(job.id, { cancelled: true });
+    }, Math.max(1000, job.timeoutMs));
     timer.unref?.();
     try {
       for await (const ev of queue) {
@@ -285,7 +306,7 @@ export class ExtensionProvider implements ChatProvider {
       signal.removeEventListener('abort', onAbort);
       if (this.jobs.has(job.id)) {
         this.send(conn, { type: 'cancel', jobId: job.id });
-        this.finishJob(job.id);
+        this.finishJob(job.id, { cancelled: true });
       }
     }
   }

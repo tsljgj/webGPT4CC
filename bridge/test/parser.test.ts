@@ -264,6 +264,87 @@ describe('parseReply', () => {
   });
 });
 
+describe('parseReply hardening', () => {
+  it('ends CDATA only at a "]]>" followed by the closing tag', () => {
+    const v = 'a <![CDATA[ x ]]> b';
+    const r = parseReply(`<tool_call name="Write">\n<param name="file_path">/f</param>\n<param name="content"><![CDATA[${v}]]></param>\n</tool_call>`, TOOLS);
+    assert.equal(tools(r)[0]!.input.content, v);
+    assert.equal(r.toolCalls, 1);
+  });
+
+  it('reads a value that only starts with CDATA as raw text', () => {
+    const r = parseReply('<tool_call name="Write">\n<param name="file_path">/f</param>\n<param name="content"><![CDATA[x]]> and more</param>\n</tool_call>', TOOLS);
+    assert.equal(tools(r)[0]!.input.content, '<![CDATA[x]]> and more');
+  });
+
+  it('strips one newline inside CDATA written on its own lines', () => {
+    const r = parseReply('<tool_call name="Write">\n<param name="file_path">/f</param>\n<param name="content"><![CDATA[\nline\n]]></param>\n</tool_call>', TOOLS);
+    assert.equal(tools(r)[0]!.input.content, 'line');
+  });
+
+  it('does not run calls written after a made-up tool result', () => {
+    const r = parseReply(
+      '<tool_call name="Bash">\n<param name="command">ls</param>\n</tool_call>\n<tool_result name="Bash">a.txt</tool_result>\n<tool_call name="Bash">\n<param name="command">rm a.txt</param>\n</tool_call>',
+      TOOLS,
+    );
+    assert.deepEqual(tools(r).map((t) => t.input.command), ['ls']);
+    assert.ok(r.warnings.some((w) => /made-up/.test(w)));
+  });
+
+  it('treats fenced calls followed by explanation as an example', () => {
+    const r = parseReply('Done. The harness ran:\n```\n<tool_call name="Bash">\n<param name="command">rm -rf build</param>\n</tool_call>\n```\nThat cleaned the build.', TOOLS);
+    assert.equal(r.toolCalls, 0);
+    assert.equal(r.blocks.length, 1);
+    assert.match((r.blocks[0] as { text: string }).text, /That cleaned the build\.$/);
+  });
+
+  it('ignores calls inside a code block that holds other content', () => {
+    const r = parseReply('Example:\n```xml\n<!-- the format -->\n<tool_call name="Bash">\n<param name="command">x</param>\n</tool_call>\n```\nOK', TOOLS);
+    assert.equal(r.toolCalls, 0);
+  });
+
+  it('ignores indented (code block) calls', () => {
+    const r = parseReply('Like this:\n\n    <tool_call name="Bash">\n    <param name="command">x</param>\n    </tool_call>\n', TOOLS);
+    assert.equal(r.toolCalls, 0);
+  });
+
+  it('keeps a code block that is closed before a real call', () => {
+    const r = parseReply('Plan:\n```sh\nmake\n```\n<tool_call name="Bash">\n<param name="command">make</param>\n</tool_call>', TOOLS);
+    assert.equal(r.toolCalls, 1);
+    assert.equal((r.blocks[0] as { text: string }).text, 'Plan:\n```sh\nmake\n```');
+  });
+
+  it('keeps a JSON body whose arguments include a "name" field', () => {
+    const named: ToolDefinition[] = [{ name: 'Create', input_schema: { type: 'object', properties: { name: { type: 'string' }, size: { type: 'number' } } } }];
+    const r = parseReply('<tool_call name="Create">{"name": "box", "size": 3}</tool_call>', named);
+    assert.deepEqual(tools(r)[0]!.input, { name: 'box', size: 3 });
+  });
+
+  it('does not add a newline to NotebookEdit new_source', () => {
+    const nb: ToolDefinition[] = [{ name: 'NotebookEdit', input_schema: { type: 'object', properties: { new_source: { type: 'string' } } } }];
+    const r = parseReply('<tool_call name="NotebookEdit">\n<param name="new_source">\nprint(1)\n</param>\n</tool_call>', nb);
+    assert.equal(tools(r)[0]!.input.new_source, 'print(1)');
+  });
+
+  it('can treat the whole reply as text', () => {
+    const r = parseReply('<tool_call name="Bash">\n<param name="command">ls</param>\n</tool_call>', TOOLS, { toolCalls: false });
+    assert.equal(r.toolCalls, 0);
+    assert.equal(r.blocks[0]!.type, 'text');
+  });
+
+  it('flags a value cut off mid-way as incomplete', () => {
+    const r = parseReply('<tool_call name="Write">\n<param name="file_path">/f</param>\n<param name="content">\npartial', TOOLS);
+    assert.equal((r.blocks[0] as { incomplete?: boolean }).incomplete, true);
+  });
+
+  it('handles long whitespace runs quickly', () => {
+    const t0 = Date.now();
+    safeStreamPrefix('x' + ' '.repeat(200_000) + 'y\n');
+    parseReply('x' + ' '.repeat(200_000) + 'y', TOOLS);
+    assert.ok(Date.now() - t0 < 500);
+  });
+});
+
 describe('safeStreamPrefix', () => {
   it('only releases complete lines', () => {
     assert.equal(safeStreamPrefix('Hello wor').safe, '');
@@ -291,5 +372,19 @@ describe('safeStreamPrefix', () => {
       if (safe.length > prev.length) prev = safe;
     }
     assert.equal(prev, 'Intro line\n\n```ts\nx\n```\nMore\n');
+  });
+});
+
+describe('schema coercion', () => {
+  it('handles untyped, allOf and nullable parameters', async () => {
+    const { coerceValue, isStringSchema } = await import('../src/translate/schema.ts');
+    assert.deepEqual(coerceValue('{"a": 1}', {}), { a: 1 });
+    assert.equal(coerceValue('hello', {}), 'hello');
+    assert.equal(coerceValue('42', { $ref: '#/defs/n' }), 42);
+    assert.equal(coerceValue('7', { allOf: [{ type: 'integer' }, { minimum: 1 }] }), 7);
+    assert.equal(coerceValue('null', { type: ['string', 'null'] }), null);
+    assert.equal(coerceValue(' text ', { type: ['string', 'null'] }), ' text ');
+    assert.equal(isStringSchema({}), false);
+    assert.equal(isStringSchema({ type: 'string' }), true);
   });
 });

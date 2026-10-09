@@ -32,6 +32,19 @@ import {
   visibleTools,
 } from './translate/render.ts';
 
+interface Orphan {
+  timer: NodeJS.Timeout;
+  /** Session/agent scope of the abandoned request. */
+  scope: string;
+  conversationId?: string;
+  /** Whether the abandoned turn already reached ChatGPT. */
+  submitted: () => boolean;
+  cancel: () => void;
+}
+
+const INTERRUPTED_NOTE =
+  '[Note from the bridge: your previous reply was interrupted by the user before it was used. None of its tool calls were executed; continue from the message below.]';
+
 const TRUNCATED_NOTE =
   '[Note from the bridge: your previous reply was cut off by ChatGPT\'s output limit inside a tool call. That incomplete call was discarded and NOT executed. Re-issue it; split large file contents across several smaller Write/Edit calls.]';
 
@@ -56,7 +69,11 @@ export interface BridgeState {
    * a retry of the same request (Claude Code retries after stream watchdog
    * aborts) can adopt them instead of starting a new ChatGPT turn.
    */
-  orphans: Map<string, { timer: NodeJS.Timeout; conversationId?: string; cancel: () => void }>;
+  orphans: Map<string, Orphan>;
+  /** ChatGPT conversations with a turn in flight (a second continuation would interleave). */
+  activeConversations: Set<string>;
+  /** The agent-loop turn in flight per Claude Code session/agent (they are strictly sequential). */
+  mainInflight: Map<string, Omit<Orphan, 'timer'> & { rHash: string }>;
   /** When ChatGPT reported a usage cap, fail fast until this time. */
   rateLimitedUntil: number;
   rateLimitMessage: string;
@@ -73,6 +90,8 @@ export function createState(config: BridgeConfig, provider: ChatProvider, log: L
     interrupted: new Set(),
     notes: new Map(),
     orphans: new Map(),
+    activeConversations: new Set(),
+    mainInflight: new Map(),
     rateLimitedUntil: 0,
     rateLimitMessage: '',
     stats: { requests: 0, chatgptTurns: 0, localReplies: 0, errors: 0, continued: 0, replayed: 0 },
@@ -169,7 +188,7 @@ interface Plan {
   tools: ToolDefinition[];
 }
 
-function planTurn(state: BridgeState, req: MessagesRequest, kind: RequestKind, chatModel: string): Plan {
+function planTurn(state: BridgeState, req: MessagesRequest, kind: RequestKind, chatModel: string, scope: string): Plan {
   const { config } = state;
   const tools = kind === 'main' ? visibleTools(req.tools, config.render) : [];
   if (kind === 'web_search') {
@@ -179,17 +198,16 @@ function planTurn(state: BridgeState, req: MessagesRequest, kind: RequestKind, c
   if (kind === 'main' && config.conversationMode === 'continue') {
     const i = lastAssistantIndex(req.messages);
     if (i >= 0) {
-      const fp = assistantFingerprint(req.messages[i]!.content);
+      const fp = assistantFingerprint(req.messages[i]!.content, scope);
       const turn = state.sessions.lookup(fp, i, contextHash(req, chatModel));
-      if (turn && turn.conversationTokens < config.maxConversationTokens) {
+      // A turn already running in that conversation (another client continuing the same
+      // transcript) would interleave with this one: use a fresh conversation instead.
+      if (turn && state.activeConversations.has(turn.conversationId)) state.log.warn('conversation busy with another request; starting a new ChatGPT chat');
+      else if (turn && turn.conversationTokens < config.maxConversationTokens) {
         let prompt = renderDeltaPrompt(reqForRender, i + 1, config.render).text;
         const note = state.notes.get(turn.conversationId);
         if (note) prompt = `${note}\n\n${prompt}`;
-        if (state.interrupted.has(turn.conversationId)) {
-          prompt =
-            '[Note from the bridge: your previous reply was interrupted by the user before it was used. None of its tool calls were executed; continue from the message below.]\n\n' +
-            prompt;
-        }
+        if (state.interrupted.has(turn.conversationId)) prompt = `${INTERRUPTED_NOTE}\n\n${prompt}`;
         return {
           kind,
           chatModel,
@@ -248,9 +266,14 @@ function finalize(parsed: ReturnType<typeof parseReply>, emittedText: string, fi
   for (const b of parsed.blocks) {
     if (b.type === 'text') {
       if (first && emittedText) {
-        // The prefix was already streamed; only the remainder is new.
+        // The prefix was already streamed; only the remainder is new. If the final text
+        // diverges from what was streamed (rare), append what follows the common prefix.
         if (b.text.startsWith(emittedText)) extraText = b.text.slice(emittedText.length);
-        else if (!emittedText.startsWith(b.text)) extraText = '';
+        else if (!emittedText.startsWith(b.text)) {
+          let k = 0;
+          while (k < b.text.length && k < emittedText.length && b.text[k] === emittedText[k]) k++;
+          extraText = `\n${b.text.slice(k)}`;
+        }
         blocks.push({ type: 'text', text: emittedText + extraText });
       } else {
         blocks.push({ type: 'text', text: b.text });
@@ -361,7 +384,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
       state.orphans.delete(rHash);
       log.info('retry adopted the ChatGPT turn that is still running');
       res.on('close', () => {
-        if (!res.writableEnded) armOrphan(state, rHash, orphan.conversationId, orphan.cancel);
+        if (!res.writableEnded) armOrphan(state, rHash, orphan);
       });
     } else log.info('duplicate request: reusing the reply already produced for it');
     try {
@@ -378,26 +401,47 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     return;
   }
 
-  // 3. Plan the ChatGPT turn (continue an existing conversation or start a new one).
-  let plan = planTurn(state, req, kind, chatModel);
+  // 3. Agent-loop requests of one session/agent are strictly sequential, so a different one
+  //    supersedes whatever turn is still running for it (typically: Esc, then a new message).
+  //    Cancel that turn now instead of letting it finish or waiting out the orphan grace period.
+  const superseded: Array<Omit<Orphan, 'timer'>> = [];
+  const prev = scope && kind === 'main' ? state.mainInflight.get(scope) : undefined;
+  if (prev && prev.rHash !== rHash) {
+    log.info('a new request supersedes the turn still running for this session; cancelling it');
+    clearOrphan(state, prev.rHash);
+    state.mainInflight.delete(scope);
+    if (prev.conversationId) state.activeConversations.delete(prev.conversationId);
+    superseded.push(prev);
+    prev.cancel();
+  }
+
+  // 4. Plan the ChatGPT turn (continue an existing conversation or start a new one).
+  let plan = planTurn(state, req, kind, chatModel, scope);
   if (plan.conversation.kind === 'continue') {
     state.stats.continued++;
-    // A new request for this conversation supersedes an abandoned turn on it.
     const convId = plan.conversation.conversationId;
-    for (const [key, o] of state.orphans)
-      if (o.conversationId === convId) {
-        log.info('cancelling an abandoned turn in the same conversation');
-        clearTimeout(o.timer);
-        state.orphans.delete(key);
-        o.cancel();
-      }
+    // Its previous turn was abandoned after reaching ChatGPT: say so (the catch handler of the
+    // abandoned turn runs too late to add the note for this request).
+    if (superseded.some((o) => o.conversationId === convId && o.submitted()) && !plan.prompt.startsWith(INTERRUPTED_NOTE))
+      plan = { ...plan, prompt: `${INTERRUPTED_NOTE}\n\n${plan.prompt}` };
   } else if (lastAssistantIndex(req.messages) >= 0 && kind === 'main') state.stats.replayed++;
 
   const abort = new AbortController();
   let finished = false;
+  let submitted = false;
   const conversationId = plan.conversation.kind === 'continue' ? plan.conversation.conversationId : undefined;
+  if (conversationId) state.activeConversations.add(conversationId);
+  const inflight = { rHash, scope, conversationId, submitted: () => submitted, cancel: () => abort.abort() };
+  if (scope && kind === 'main') state.mainInflight.set(scope, inflight);
+  const settle = () => {
+    finished = true;
+    clearOrphan(state, rHash);
+    if (conversationId) state.activeConversations.delete(conversationId);
+    if (state.mainInflight.get(scope) === inflight) state.mainInflight.delete(scope);
+  };
   res.on('close', () => {
-    if (!finished) armOrphan(state, rHash, conversationId, () => abort.abort());
+    writer?.dispose();
+    if (!finished) armOrphan(state, rHash, inflight);
   });
 
   let writer: SseMessageWriter | undefined;
@@ -411,6 +455,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   let lastFull = '';
   let thoughts = '';
   const onProgress = (ev: ChatEvent) => {
+    if (ev.type === 'text' || (ev.type === 'status' && (ev.status === 'submitted' || ev.status === 'generating' || ev.status === 'thinking'))) submitted = true;
     if (ev.type === 'status' && (ev.status === 'submitted' || ev.status === 'generating' || ev.status === 'thinking')) startStream();
     // ChatGPT's reasoning summary (whole text so far) -> a thinking block, before any content.
     if (ev.type === 'status' && ev.status === 'thinking' && ev.detail && config.showThinking && stream && writer && !emitted) {
@@ -455,7 +500,8 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
       result = await runJob(state, plan, abort.signal, onProgress);
     }
     state.stats.chatgptTurns++;
-    const parsed = parseReply(result.text, plan.tools);
+    const textOnly = plan.tools.length === 0 || req.tool_choice?.type === 'none';
+    const parsed = parseReply(result.text, plan.tools, { toolCalls: !textOnly });
     for (const w of parsed.warnings) log.warn(`parser: ${w}`);
     // A reply cut off by ChatGPT's output limit must not run a half-written tool call
     // (e.g. a Write with truncated content). Drop it and tell the model next turn.
@@ -481,7 +527,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     if (plan.kind === 'main') {
       const assistantIndex = req.messages.length; // index the reply will have in the next request
       const prevTokens = plan.fromTurn?.conversationTokens ?? 0;
-      state.sessions.record(assistantFingerprint(done.blocks), {
+      state.sessions.record(assistantFingerprint(done.blocks, scope), {
         conversationId: result.conversationId,
         assistantMessageId: result.messageId,
         workerId: result.workerId,
@@ -494,8 +540,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
       state.interrupted.delete(result.conversationId);
       if (plan.conversation.kind === 'continue' && state.notes.get(result.conversationId) !== TRUNCATED_NOTE) state.notes.delete(result.conversationId);
     }
-    finished = true;
-    clearOrphan(state, rHash);
+    settle();
     const completed: Completed = { blocks: done.blocks, stopReason: done.stopReason, outputTokens: done.outputTokens };
     resolveDone(completed);
     if (res.destroyed) return;
@@ -509,13 +554,13 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
       sendJson(res, 200, buildMessageResponse(req.model, completed.blocks, completed.stopReason, usage(inputTokens, completed.outputTokens)));
     }
   } catch (e) {
-    finished = true;
-    clearOrphan(state, rHash);
+    settle();
     state.stats.errors++;
     const err = e instanceof BridgeError ? e : new BridgeError('api_error', (e as Error)?.message ?? String(e), true);
     rejectDone(err);
     state.cache.delete(rHash);
-    if (plan.conversation.kind === 'continue' && (abort.signal.aborted || lastFull)) state.interrupted.add(plan.conversation.conversationId);
+    // The turn reached ChatGPT but its reply was never delivered: the next message must say so.
+    if (plan.conversation.kind === 'continue' && submitted && (abort.signal.aborted || lastFull)) state.interrupted.add(plan.conversation.conversationId);
     if (err.type === 'rate_limit_error') {
       state.rateLimitedUntil = Date.now() + (err.retryAfterMs ?? 60_000);
       state.rateLimitMessage = err.message.replace(/^ChatGPT usage limit: /, '');
@@ -535,7 +580,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
   }
 }
 
-function armOrphan(state: BridgeState, rHash: string, conversationId: string | undefined, cancel: () => void): void {
+function armOrphan(state: BridgeState, rHash: string, o: Omit<Orphan, 'timer'>): void {
   const graceMs = state.config.orphanGraceMs;
   state.log.info(`client disconnected; keeping the ChatGPT turn alive ${Math.round(graceMs / 1000)}s for a retry`);
   const existing = state.orphans.get(rHash);
@@ -543,10 +588,10 @@ function armOrphan(state: BridgeState, rHash: string, conversationId: string | u
   const timer = setTimeout(() => {
     state.orphans.delete(rHash);
     state.log.info('no retry arrived; cancelling the abandoned ChatGPT turn');
-    cancel();
+    o.cancel();
   }, graceMs);
   timer.unref?.();
-  state.orphans.set(rHash, { timer, conversationId, cancel });
+  state.orphans.set(rHash, { ...o, timer });
 }
 
 function clearOrphan(state: BridgeState, rHash: string): void {
