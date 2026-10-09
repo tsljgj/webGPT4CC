@@ -18,6 +18,12 @@ export interface RenderOptions {
   paramDescriptionMaxChars: number;
   /** Truncate any single tool result to this many characters (0 = no limit). */
   maxToolResultChars: number;
+  /**
+   * Upper bound for one ChatGPT message. The extension pastes prompts into the
+   * composer, which gets unreliable for very large inputs; older history and
+   * large tool results are shortened to stay below this (0 = no limit).
+   */
+  maxPromptChars: number;
   /** When replaying an existing transcript, older tool results beyond this total budget are shortened (0 = no limit). */
   replayToolResultBudgetChars: number;
   /** Append a short protocol reminder to follow-up messages. */
@@ -36,8 +42,9 @@ export const DEFAULT_EXCLUDED_TOOLS = ['DesignSync', 'ScheduleWakeup', 'CronCrea
 export const DEFAULT_RENDER_OPTIONS: RenderOptions = {
   toolDescriptionMaxChars: 2000,
   paramDescriptionMaxChars: 300,
-  maxToolResultChars: 120_000,
-  replayToolResultBudgetChars: 200_000,
+  maxToolResultChars: 50_000,
+  maxPromptChars: 100_000,
+  replayToolResultBudgetChars: 40_000,
   reminderFooter: true,
   excludeTools: DEFAULT_EXCLUDED_TOOLS,
 };
@@ -284,35 +291,91 @@ export interface RenderedPrompt {
   covered: number;
 }
 
+/** Render the newest turn (everything after the last assistant message). */
+function renderLatest(latest: MessageParam[], index: RenderCtx['index'], opts: RenderOptions, resultCap: number): string {
+  const ctx: RenderCtx = { index, opts, resultCap };
+  return latest
+    .map((m) => renderLatestBody(m, ctx))
+    .filter((s) => s.trim())
+    .join('\n\n');
+}
+
+function countToolResults(messages: MessageParam[]): number {
+  let n = 0;
+  for (const m of messages) if (typeof m.content !== 'string') for (const b of m.content) if (b.type === 'tool_result') n++;
+  return n;
+}
+
+/**
+ * Render `messages` within `budget` characters by shrinking tool results;
+ * as a last resort cut the middle of the text.
+ */
+function fitLatest(messages: MessageParam[], index: RenderCtx['index'], opts: RenderOptions, budget: number): string {
+  let text = renderLatest(messages, index, opts, 0);
+  if (text.length <= budget) return text;
+  const n = Math.max(1, countToolResults(messages));
+  for (const cap of [Math.floor(budget / n) - 200, 8000, 2000, 500]) {
+    if (cap <= 0) continue;
+    text = renderLatest(messages, index, opts, cap);
+    if (text.length <= budget) return text;
+  }
+  const keep = Math.max(0, budget - 200);
+  return `${text.slice(0, Math.floor(keep * 0.7))}\n[... ${text.length - keep} characters omitted by the bridge to fit ChatGPT's message size limit ...]\n${text.slice(text.length - Math.ceil(keep * 0.3))}`;
+}
+
+const HISTORY_INTRO =
+  '# Conversation so far\n\nThis conversation was started elsewhere; here is the transcript (your earlier turns are shown as role="assistant").';
+
+/** Replay earlier messages within `budget` characters (newest messages are kept first). */
+function renderHistory(history: MessageParam[], index: RenderCtx['index'], opts: RenderOptions, budget: number): string {
+  if (!history.length) return '';
+  const render = (caps: number[] | number) =>
+    history.map((m, i) => wrap(m.role, renderMessageBody(m, { index, opts, resultCap: typeof caps === 'number' ? caps : caps[i]! })));
+  let parts = render(historyResultCaps(history, opts));
+  const total = (xs: string[]) => xs.reduce((a, x) => a + x.length + 2, HISTORY_INTRO.length + 2);
+  if (total(parts) <= budget) return `${HISTORY_INTRO}\n\n${parts.join('\n\n')}`;
+  parts = render(2000);
+  if (total(parts) <= budget) return `${HISTORY_INTRO}\n\n${parts.join('\n\n')}`;
+  // Keep the first message (usually the task) and as many recent messages as fit.
+  const marker = (n: number) => `[... ${n} earlier message(s) omitted by the bridge to fit ChatGPT's message size limit ...]`;
+  let first = parts[0]!;
+  if (first.length > budget / 4) first = `${first.slice(0, Math.floor(budget / 4))}\n[... truncated ...]\n</message>`;
+  let used = HISTORY_INTRO.length + first.length + marker(history.length).length + 8;
+  const tail: string[] = [];
+  for (let i = parts.length - 1; i >= 1; i--) {
+    if (used + parts[i]!.length + 2 > budget) break;
+    used += parts[i]!.length + 2;
+    tail.unshift(parts[i]!);
+  }
+  const omitted = parts.length - 1 - tail.length;
+  if (budget <= used - tail.reduce((a, x) => a + x.length + 2, 0)) return `${HISTORY_INTRO}\n\n${marker(history.length)}`;
+  return [HISTORY_INTRO, first, ...(omitted ? [marker(omitted)] : []), ...tail].join('\n\n');
+}
+
 /**
  * First message of a new ChatGPT conversation: bridge protocol, harness system
  * prompt, tool list, replay of any earlier transcript, then the latest turn.
+ * The result is kept under `opts.maxPromptChars` (older history goes first).
  */
 export function renderFullPrompt(req: MessagesRequest, opts: RenderOptions = DEFAULT_RENDER_OPTIONS): RenderedPrompt {
   const tools = visibleTools(req.tools, opts);
   const index = toolUseIndex(req.messages);
-  const sections: string[] = [protocolInstructions(tools)];
+  const head: string[] = [protocolInstructions(tools)];
   const sys = systemText(req.system);
-  if (sys) sections.push(`# Harness system prompt\n\n${sys}`);
-  if (tools.length) sections.push(`# Available tools\n\n${renderTools(tools, opts)}`);
+  if (sys) head.push(`# Harness system prompt\n\n${sys}`);
+  if (tools.length) head.push(`# Available tools\n\n${renderTools(tools, opts)}`);
+  const headText = head.join('\n\n');
 
   const last = lastAssistantIndex(req.messages);
   const history = last >= 0 ? req.messages.slice(0, last + 1) : [];
   const latest = req.messages.slice(last + 1);
-
-  if (history.length) {
-    // Spend the tool-result budget on the most recent results first.
-    const caps = historyResultCaps(history, opts);
-    const replay = history.map((m, i) => wrap(m.role, renderMessageBody(m, { index, opts, resultCap: caps[i]! })));
-    sections.push(
-      '# Conversation so far\n\nThis conversation was started elsewhere; here is the transcript (your earlier turns are shown as role="assistant").\n\n' +
-        replay.join('\n\n'),
-    );
-  }
-  const ctx: RenderCtx = { index, opts, resultCap: 0 };
-  const latestText = latest.map((m) => renderLatestBody(m, ctx)).filter((s) => s.trim()).join('\n\n');
-  sections.push(`# Latest message (respond to this)\n\n${latestText || '(empty)'}${toolChoiceNote(req)}`);
-  return { text: sections.join('\n\n'), covered: req.messages.length };
+  const max = opts.maxPromptChars > 0 ? opts.maxPromptChars : Number.MAX_SAFE_INTEGER;
+  const note = toolChoiceNote(req);
+  const latestBudget = Math.max(4000, Math.floor((max - headText.length) * (history.length ? 0.6 : 1)) - note.length - 100);
+  const latestText = fitLatest(latest, index, opts, latestBudget);
+  const latestSection = `# Latest message (respond to this)\n\n${latestText || '(empty)'}${note}`;
+  const historyText = renderHistory(history, index, opts, max - headText.length - latestSection.length - 10);
+  return { text: [headText, historyText, latestSection].filter(Boolean).join('\n\n'), covered: req.messages.length };
 }
 
 function historyResultCaps(history: MessageParam[], opts: RenderOptions): number[] {
@@ -337,20 +400,19 @@ function historyResultCaps(history: MessageParam[], opts: RenderOptions): number
 
 /**
  * Follow-up message in an existing ChatGPT conversation: only the messages
- * after the last assistant turn (tool results, user text, harness notes).
+ * after the last assistant turn (tool results, user text, harness notes),
+ * kept under `opts.maxPromptChars`.
  */
 export function renderDeltaPrompt(req: MessagesRequest, fromIndex: number, opts: RenderOptions = DEFAULT_RENDER_OPTIONS): RenderedPrompt {
   const index = toolUseIndex(req.messages);
-  const ctx: RenderCtx = { index, opts, resultCap: 0 };
-  const parts = req.messages
-    .slice(fromIndex)
-    .map((m) => renderLatestBody(m, ctx))
-    .filter((s) => s.trim());
-  let text = parts.join('\n\n') || '(continue)';
-  text += toolChoiceNote(req);
-  if (opts.reminderFooter && visibleTools(req.tools, opts).length && !isTextOnlyRequest(req) && req.tool_choice?.type !== 'none')
-    text += `\n\n${REMINDER_FOOTER}`;
-  return { text, covered: req.messages.length };
+  const max = opts.maxPromptChars > 0 ? opts.maxPromptChars : Number.MAX_SAFE_INTEGER;
+  const footer =
+    opts.reminderFooter && visibleTools(req.tools, opts).length && !isTextOnlyRequest(req) && req.tool_choice?.type !== 'none'
+      ? `\n\n${REMINDER_FOOTER}`
+      : '';
+  const note = toolChoiceNote(req);
+  const body = fitLatest(req.messages.slice(fromIndex), index, opts, max - footer.length - note.length);
+  return { text: (body || '(continue)') + note + footer, covered: req.messages.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +428,7 @@ export function estimateTokens(text: string): number {
   return Math.ceil(ascii / 3.8 + other * 0.9);
 }
 
+/** Size of the whole transcript as the model would see it (no truncation): drives Claude Code's compaction. */
 export function estimateRequestTokens(req: MessagesRequest, opts: RenderOptions = DEFAULT_RENDER_OPTIONS): number {
-  return estimateTokens(renderFullPrompt(req, { ...opts, replayToolResultBudgetChars: 0 }).text);
+  return estimateTokens(renderFullPrompt(req, { ...opts, replayToolResultBudgetChars: 0, maxPromptChars: 0, maxToolResultChars: 0 }).text);
 }
