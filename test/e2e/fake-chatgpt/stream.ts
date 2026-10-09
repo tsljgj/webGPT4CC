@@ -42,6 +42,8 @@ export interface TurnStreamSpec {
   /** Id of the final answer message. */
   assistantMessageId: string;
   modelSlug: string;
+  /** server_ste_metadata.product_experience ("work" for Work-mode turns). */
+  productExperience?: 'chat' | 'work';
   answer: string;
   finishReason: 'stop' | 'max_tokens' | 'interrupted';
   /** Reasoning summaries streamed as a `thoughts` message (+ a `reasoning_recap`) before the answer. */
@@ -153,8 +155,8 @@ export function buildTurnStream(spec: TurnStreamSpec): TurnStream {
       is_first_turn: spec.newConversation,
       model_slug: spec.modelSlug,
       resolved_model_slug: spec.modelSlug,
-      requested_model_experience: spec.thoughts ? 'thinking' : 'chat',
-      product_experience: 'chat',
+      requested_model_experience: spec.productExperience === 'work' ? 'work' : spec.thoughts ? 'thinking' : 'chat',
+      product_experience: spec.productExperience ?? 'chat',
       did_auto_switch_to_reasoning: false,
       is_search: false,
       message_id: spec.assistantMessageId,

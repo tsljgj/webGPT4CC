@@ -20,7 +20,7 @@
 (function (root) {
   'use strict';
 
-  const CORE_VERSION = 1;
+  const CORE_VERSION = 2;
   if (root.WebGPT4CC_Core && root.WebGPT4CC_Core.version === CORE_VERSION) return;
 
   const isObj = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -42,6 +42,15 @@
 
   function isResumePath(pathname) {
     return /\/conversation\/resume\/?$/.test(String(pathname || ''));
+  }
+
+  /**
+   * Requests the page makes between a click on Send and the conversation POST
+   * (Sentinel and conduit prepare). A 429 there means the send was refused for
+   * rate limiting even though no conversation request follows.
+   */
+  function isSendPipelinePath(pathname) {
+    return /^\/backend-api\/(?:sentinel\/chat-requirements(?:\/[\w-]+)?|f\/conversation\/prepare)\/?$/.test(String(pathname || ''));
   }
 
   // ---------------------------------------------------------------------------
@@ -354,6 +363,8 @@
       lastO: '',
       conversationId: null,
       modelSlug: null,
+      productExperience: null, // server_ste_metadata: "chat" or "work"
+      requestedModelExperience: null,
       encoding: null,
       complete: false, // message_stream_complete seen
       doneSeen: false, // data: [DONE] seen
@@ -437,6 +448,8 @@
           const md = isObj(obj.metadata) ? obj.metadata : {};
           const slug = md.resolved_model_slug || md.model_slug;
           if (typeof slug === 'string') st.modelSlug = slug;
+          if (typeof md.product_experience === 'string') st.productExperience = md.product_experience;
+          if (typeof md.requested_model_experience === 'string') st.requestedModelExperience = md.requested_model_experience;
           return true;
         }
         case 'stream_handoff': {
@@ -521,6 +534,8 @@
         thinking: !text && msgs.some(isReasoningMessage),
         reasoning: text ? '' : reasoningText(msgs),
         modelSlug: st.modelSlug,
+        productExperience: st.productExperience,
+        requestedModelExperience: st.requestedModelExperience,
         complete: st.complete,
         doneSeen: st.doneSeen,
         error: st.error,
@@ -595,32 +610,72 @@
       if (!t) topics.set(id, (t = { seen: new Set(), ended: false }));
       return t;
     };
-    return {
-      process(value) {
-        const res = { chunks: [], done: [], errors: [] };
-        for (const item of extractWsTurnItems(value)) {
-          const t = topic(item.topicId);
-          if (t.ended) continue;
-          if (item.type === 'done') {
-            t.ended = true;
-            res.done.push(item.topicId);
-          } else if (item.type === 'error') {
-            t.ended = true;
-            res.errors.push({ topicId: item.topicId, message: item.message });
-          } else {
-            if (item.streamItemId) {
-              if (t.seen.has(item.streamItemId)) continue;
-              t.seen.add(item.streamItemId);
-            }
-            res.chunks.push({ topicId: item.topicId, text: item.encodedItem });
+    function processItems(items) {
+      const res = { chunks: [], done: [], errors: [] };
+      for (const item of items || []) {
+        const t = topic(item.topicId);
+        if (t.ended) continue;
+        if (item.type === 'done') {
+          t.ended = true;
+          res.done.push(item.topicId);
+        } else if (item.type === 'error') {
+          t.ended = true;
+          res.errors.push({ topicId: item.topicId, message: item.message });
+        } else {
+          if (item.streamItemId) {
+            if (t.seen.has(item.streamItemId)) continue;
+            t.seen.add(item.streamItemId);
           }
+          res.chunks.push({ topicId: item.topicId, text: item.encodedItem });
         }
-        return res;
+      }
+      return res;
+    }
+    return {
+      /** A raw WebSocket frame (string or parsed JSON). */
+      process(value) {
+        return processItems(extractWsTurnItems(value));
       },
+      /** Items already extracted with extractWsTurnItems. */
+      processItems,
       ended(topicId) {
         return !!topics.get(topicId)?.ended;
       },
     };
+  }
+
+  /**
+   * Cheap look at one SSE event for the page-level "is a reply streaming" tracker
+   * (which also watches conversation requests that are not ours): does it end
+   * the stream, or hand it off to WebSocket topics? Only frames that mention a
+   * marker are parsed.
+   * Returns { complete, done, topics: string[] }.
+   */
+  function scanStreamEvent(ev) {
+    const out = { complete: false, done: false, topics: [] };
+    const data = ev && typeof ev.data === 'string' ? ev.data.trim() : '';
+    if (!data) return out;
+    if (data === '[DONE]') {
+      out.done = true;
+      return out;
+    }
+    if (data.indexOf('message_stream_complete') === -1 && data.indexOf('stream_handoff') === -1) return out;
+    let obj;
+    try {
+      obj = JSON.parse(data);
+    } catch {
+      return out;
+    }
+    if (!isObj(obj)) return out;
+    if (obj.type === 'message_stream_complete') out.complete = true;
+    else if (obj.type === 'stream_handoff') {
+      const add = (t) => {
+        if (typeof t === 'string' && t && !out.topics.includes(t)) out.topics.push(t);
+      };
+      if (Array.isArray(obj.options)) for (const o of obj.options) if (isObj(o)) add(o.topic_id);
+      add(obj.topic_id);
+    }
+    return out;
   }
 
   // ---------------------------------------------------------------------------
@@ -701,6 +756,16 @@
    * Classify visible UI warning text (dialogs, toasts, banners):
    * 'rate_limit' | 'usage_cap' | 'temporary_unavailable' | 'auth_or_challenge' | null.
    */
+  // Localized wording (zh-CN / zh-TW / ja) next to the English patterns: the UI
+  // text follows the account's language, so English-only patterns miss every
+  // limit dialog of a Chinese or Japanese UI. Network signals (HTTP 429) are
+  // classified independently of language; these are the DOM fallback.
+  const RATE_LIMIT_LOCAL = /请求过多|请求太多|请求过于频繁|过于频繁|太频繁|发送(?:得|的)?太快|速度太快|暂时限制|已暂时限制|请稍等几分钟|請求過多|過於頻繁|暫時限制|リクエストが多すぎ|リクエスト数が多すぎ/;
+  const USAGE_CAP_LOCAL =
+    /(?:已达到|已达|达到了|达到|已用完|用完了|用尽了?|已用盡|已達到|達到|已達)[^。.!！?？]{0,40}(?:上限|限额|限制|额度|額度|限額)|(?:上限|限额|额度|額度|限額)[^。.!！?？]{0,40}(?:重置|恢复|恢復)|上限に達し|制限に達し/;
+  const TEMPORARY_LOCAL = /出错了|出了点问题|出现错误|发生错误|暂时不可用|暂不可用|无法生成|生成失败|稍后再试|稍後再試|网络错误|網路錯誤|發生錯誤|エラーが発生|しばらくしてから/;
+  const CHALLENGE_LOCAL = /验证你是真人|验证您是真人|确认你是真人|确认您是真人|驗證您是真人|异常活动|可疑活动|異常活動|请登录|請登入|请重新登录|重新登录|重新登入|登录已过期|会话已过期|ログインしてください|再度ログイン/;
+
   function classifyUiWarning(text) {
     const t = String(text || '').toLowerCase();
     if (!t.trim()) return null;
@@ -711,15 +776,17 @@
       /\btemporarily limited access\b/.test(t) ||
       /\bplease wait a few minutes\b/.test(t) ||
       /\brate limit(?:ed)?\b/.test(t) ||
-      /\bslow down\b/.test(t)
+      /\bslow down\b/.test(t) ||
+      RATE_LIMIT_LOCAL.test(t)
     )
       return 'rate_limit';
-    if (/\blimits?\b/.test(t) && /\b(?:resets?|until)\b/.test(t)) return 'usage_cap';
+    if ((/\blimits?\b/.test(t) && /\b(?:resets?|until)\b/.test(t)) || USAGE_CAP_LOCAL.test(t)) return 'usage_cap';
     if (
       /\btemporarily unavailable\b/.test(t) ||
       /\bsomething went wrong\b/.test(t) ||
       /\bfailed to generate\b/.test(t) ||
-      /\btry again later\b/.test(t)
+      /\btry again later\b/.test(t) ||
+      TEMPORARY_LOCAL.test(t)
     )
       return 'temporary_unavailable';
     if (
@@ -728,15 +795,27 @@
       /\bcloudflare\b/.test(t) ||
       /\bchallenge\b/.test(t) ||
       /\blogin required\b/.test(t) ||
-      /\bsign in\b/.test(t)
+      /\bsign in\b/.test(t) ||
+      CHALLENGE_LOCAL.test(t)
     )
       return 'auth_or_challenge';
     return null;
   }
 
+  /** Milliseconds until the next local hh:mm (tomorrow if that time already passed today). */
+  function msUntilClock(h, min, now) {
+    if (!(h >= 0 && h <= 23 && min >= 0 && min <= 59)) return undefined;
+    const d = new Date(now);
+    d.setHours(h, min, 0, 0);
+    let ms = d.getTime() - now;
+    if (ms <= 0) ms += 86400e3;
+    return ms;
+  }
+
   /**
    * Best-effort "when can we retry" from human text: "in 20 minutes",
-   * "after 3:45 PM", "until 17:30". Returns milliseconds or undefined.
+   * "after 3:45 PM", "until 17:30", "20 分钟后", "将于 18:30 后重置",
+   * "下午6:30". Returns milliseconds or undefined.
    */
   function parseRetryAfter(text, now = Date.now()) {
     const t = String(text || '');
@@ -747,6 +826,14 @@
       const unit = u.startsWith('s') ? 1e3 : u.startsWith('m') ? 60e3 : u.startsWith('h') ? 3600e3 : 86400e3;
       return Math.round(n * unit);
     }
+    // zh / ja relative: "20 分钟后", "3个小时后", "1 小時後", "30秒后", "20分後"
+    const relLocal = /(\d+(?:\.\d+)?)\s*[个個]?\s*(秒钟|秒鐘|秒|分钟|分鐘|分|小时|小時|時間|天|日)\s*(?:之?后|之?後|以后|以後)/.exec(t);
+    if (relLocal) {
+      const n = Number(relLocal[1]);
+      const u = relLocal[2];
+      const unit = u.startsWith('秒') ? 1e3 : u.startsWith('分') ? 60e3 : /^(?:小|時)/.test(u) ? 3600e3 : 86400e3;
+      return Math.round(n * unit);
+    }
     const abs = /\b(?:at|after|until)\s+(\d{1,2})(?::(\d{2}))?\s*([ap])?\.?\s*m?\.?(?=[\s.,;!)]|$)/i.exec(t);
     if (abs && (abs[2] || abs[3])) {
       let h = Number(abs[1]);
@@ -754,12 +841,17 @@
       const ap = abs[3] ? abs[3].toLowerCase() : '';
       if (ap === 'p' && h < 12) h += 12;
       if (ap === 'a' && h === 12) h = 0;
-      if (h > 23 || min > 59) return undefined;
-      const d = new Date(now);
-      d.setHours(h, min, 0, 0);
-      let ms = d.getTime() - now;
-      if (ms <= 0) ms += 86400e3;
-      return ms;
+      return msUntilClock(h, min, now);
+    }
+    // zh / ja clock time: "18:30", "下午6:30", "上午 9：05", "午後6:30"
+    const absLocal = /(上午|下午|晚上|凌晨|中午|早上|午前|午後)?\s*(\d{1,2})\s*[:：]\s*(\d{2})/.exec(t);
+    if (absLocal) {
+      let h = Number(absLocal[2]);
+      const min = Number(absLocal[3]);
+      const part = absLocal[1] || '';
+      if (/下午|晚上|午後/.test(part) && h < 12) h += 12;
+      if (/上午|凌晨|早上|午前/.test(part) && h === 12) h = 0;
+      return msUntilClock(h, min, now);
     }
     return undefined;
   }
@@ -809,12 +901,28 @@
   // GET /backend-api/conversation/{id}
   // ---------------------------------------------------------------------------
 
+  /** Text compared loosely (whitespace runs and markdown backslash escapes ignored). */
+  function looseText(s) {
+    return String(s || '')
+      .replace(/\\(?=[^\w\s])/g, '')
+      .replace(/[\s ​﻿]+/g, ' ')
+      .trim();
+  }
+
+  const isUserNode = (node) => isObj(node) && isObj(node.message) && isObj(node.message.author) && node.message.author.role === 'user';
+
   /**
-   * The answer of the latest turn in a conversation document: walk from
-   * current_node to the root, keep the messages after the last user message,
-   * apply the same answer filter as the stream.
+   * The answer to a turn in a conversation document: walk from current_node to
+   * the root, keep the messages after that turn's user message (up to the next
+   * user message), apply the same answer filter as the stream.
+   *
+   * `opts.userMessageId` (messages[0].id of the observed request) or
+   * `opts.prompt` (the text we sent) pins the turn. If neither is found in the
+   * conversation, our message never got stored there: the result is
+   * `{ userMissing: true }` instead of the previous turn's answer. Without opts
+   * the latest turn is used.
    */
-  function answerFromConversation(doc) {
+  function answerFromConversation(doc, opts) {
     if (!isObj(doc) || !isObj(doc.mapping)) return null;
     const chain = [];
     const seen = new Set();
@@ -825,11 +933,33 @@
       id = doc.mapping[id].parent;
     }
     chain.reverse();
-    let start = 0;
-    chain.forEach((node, i) => {
-      if (isObj(node.message) && isObj(node.message.author) && node.message.author.role === 'user') start = i + 1;
-    });
-    const msgs = chain.slice(start).map((n) => n.message).filter(isObj);
+    const o = isObj(opts) ? opts : {};
+    const pinned = (typeof o.userMessageId === 'string' && o.userMessageId) || (typeof o.prompt === 'string' && o.prompt.trim());
+    let userIdx = -1;
+    if (pinned) {
+      if (typeof o.userMessageId === 'string' && o.userMessageId)
+        userIdx = chain.findIndex((n) => isUserNode(n) && n.message.id === o.userMessageId);
+      if (userIdx < 0 && typeof o.prompt === 'string' && o.prompt.trim()) {
+        const want = looseText(o.prompt).slice(0, 2000);
+        for (let i = chain.length - 1; i >= 0; i--) {
+          if (!isUserNode(chain[i])) continue;
+          if (looseText(messageText(chain[i].message)).slice(0, 2000) === want) userIdx = i;
+          break; // only the latest user message can be ours
+        }
+      }
+      if (userIdx < 0) return { userMissing: true, text: '', messageId: null, conversationId: null, finishReason: null, finished: false };
+    } else {
+      chain.forEach((node, i) => {
+        if (isUserNode(node)) userIdx = i;
+      });
+    }
+    let end = chain.length;
+    for (let i = userIdx + 1; i < chain.length; i++)
+      if (isUserNode(chain[i])) {
+        end = i;
+        break;
+      }
+    const msgs = chain.slice(userIdx + 1, end).map((n) => n.message).filter(isObj);
     const ans = selectAnswer(msgs);
     if (!ans) return null;
     return {
@@ -838,6 +968,139 @@
       conversationId: typeof doc.conversation_id === 'string' ? doc.conversation_id : typeof doc.id === 'string' ? doc.id : null,
       finishReason: finishReasonOf(ans),
       finished: ans.status === 'finished_successfully' || ans.end_turn === true,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Prompt fidelity (outgoing request vs the prompt we pasted)
+  // ---------------------------------------------------------------------------
+
+  // Each normalizer removes one kind of change a markdown composer could make.
+  const FIDELITY_NORMALIZERS = [
+    ['zero-width', (s) => s.replace(/[​‌‍⁠﻿]/g, '')],
+    ['nbsp', (s) => s.replace(/ /g, ' ')],
+    ['unicode-normalization', (s) => (typeof s.normalize === 'function' ? s.normalize('NFC') : s)],
+    ['backslash-escape', (s) => s.replace(/\\([\\`*_{}[\]()#+\-.!<>~|])/g, '$1')],
+    ['trailing-whitespace', (s) => s.replace(/[ \t ]+$/gm, '')],
+    ['tabs-or-spaces', (s) => s.replace(/[\t  ]+/g, ' ')],
+    ['blank-lines', (s) => s.replace(/\n{2,}/g, '\n')],
+  ];
+
+  /**
+   * Compare the text ChatGPT's page actually sent (messages[0].content.parts)
+   * with the prompt we pasted. Only whitespace at the very start and end of the
+   * whole message is allowed to differ. Returns null when they match, else
+   * { offset, sentChars, wantChars, kinds } where `kinds` names the changes
+   * ("truncated" when the sent text is a strict prefix; otherwise the
+   * normalizers above that explain the difference, or "other").
+   */
+  function comparePromptFidelity(sentRaw, wantRaw) {
+    const sent = String(sentRaw == null ? '' : sentRaw).replace(/\r\n?/g, '\n');
+    const want = String(wantRaw == null ? '' : wantRaw).replace(/\r\n?/g, '\n');
+    const a = sent.trim();
+    const b = want.trim();
+    if (a === b) return null;
+    let offset = 0;
+    while (offset < a.length && offset < b.length && a[offset] === b[offset]) offset++;
+    const result = { offset, sentChars: sent.length, wantChars: want.length, kinds: [] };
+    if (a.length < b.length && b.startsWith(a)) {
+      result.kinds.push('truncated');
+      return result;
+    }
+    for (const [name, fn] of FIDELITY_NORMALIZERS) {
+      if (fn(a) === fn(b)) {
+        result.kinds.push(name);
+        return result;
+      }
+    }
+    let x = a;
+    let y = b;
+    const changed = [];
+    for (const [name, fn] of FIDELITY_NORMALIZERS) {
+      const nx = fn(x);
+      const ny = fn(y);
+      if (nx !== x || ny !== y) changed.push(name);
+      x = nx;
+      y = ny;
+    }
+    result.kinds = x === y ? changed : ['other'];
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Chat / Work mode, model names
+  // ---------------------------------------------------------------------------
+
+  const WORK_LABELS = new Set(['work', '工作', 'ワーク', '作業']);
+  const CHAT_LABELS = new Set(['chat', '聊天', '对话', '對話', '交談', 'チャット']);
+
+  /** 'work' | 'chat' | null for a composer mode control, from its value attributes, then its label. */
+  function composerModeOf(value, label) {
+    const v = String(value || '').trim().toLowerCase();
+    if (v === 'work' || v === 'chat') return v;
+    const l = String(label || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (WORK_LABELS.has(l)) return 'work';
+    if (CHAT_LABELS.has(l)) return 'chat';
+    return null;
+  }
+
+  /**
+   * Why a turn is a Work-mode turn (Work draws on another quota and runs agentic
+   * server-side tools), or null. Inputs come from the request body
+   * (conversation_mode.kind, model), server_ste_metadata and the conversation id.
+   */
+  function workModeReason(sig) {
+    const s = isObj(sig) ? sig : {};
+    const lc = (v) => (typeof v === 'string' ? v.toLowerCase() : '');
+    if (lc(s.conversationMode) === 'work') return 'the request has conversation_mode "work"';
+    if (lc(s.productExperience) === 'work') return 'ChatGPT reports product_experience "work"';
+    if (lc(s.requestedModelExperience) === 'work') return 'ChatGPT reports requested_model_experience "work"';
+    for (const m of [s.model, s.slug]) if (typeof m === 'string' && /-wm(?:$|[-_.])/i.test(m)) return `model "${m}" is a Work model`;
+    if (typeof s.conversationId === 'string' && /^WEB(?::|%3a)/i.test(s.conversationId)) return `conversation ${s.conversationId} is a Work conversation`;
+    return null;
+  }
+
+  /** Model names compared loosely ("gpt-5.5" == "GPT-5-5"). Empty or "auto" never matches a concrete model. */
+  function sameModel(a, b) {
+    const n = (s) =>
+      String(s || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[._\s]+/g, '-');
+    return n(a) === n(b);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cloudflare interstitial
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Classify a page from cheap DOM facts. Cloudflare bot management loads its
+   * /challenge-platform/ script on normal ChatGPT pages too, so the script alone
+   * is only weak evidence (it counts after it persists on a short page without
+   * the app shell). strong: challenge title, widget, or verification text on a
+   * short page, and no app shell. shell: ChatGPT rendered, never a challenge.
+   */
+  function cloudflareVerdict(f) {
+    const x = isObj(f) ? f : {};
+    const title = String(x.title || '').toLowerCase();
+    const titleSays =
+      /just a moment|请稍候|請稍候|しばらくお待ちください|un instant|einen moment|un momento/.test(title) ||
+      (title.includes('attention required') && title.includes('cloudflare'));
+    const body = String(x.bodyText || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+    const isShort = body.length < 600;
+    const says =
+      /verify(?:ing)? you are human|checking your browser|needs to review the security of your connection|just a moment|确认您是真人|确认你是真人|验证您是真人|验证你是真人|正在验证|正在检查(?:您|你)的浏览器|需要检查(?:您|你)的连接|人間であることを確認/.test(
+        body,
+      );
+    const shell = !!x.hasAppShell;
+    return {
+      strong: !shell && (titleSays || !!x.hasChallengeWidget || (isShort && says)),
+      shell,
+      weak: !shell && !!x.hasChallengeScript && isShort,
     };
   }
 
@@ -861,9 +1124,11 @@
     version: CORE_VERSION,
     isConversationPath,
     isResumePath,
+    isSendPipelinePath,
     createSseParser,
     parseSseBlock,
     createStreamState,
+    scanStreamEvent,
     selectAnswer,
     isAnswerCandidate,
     messageText,
@@ -878,6 +1143,11 @@
     parseRetryAfter,
     classifyHttpError,
     answerFromConversation,
+    comparePromptFidelity,
+    composerModeOf,
+    workModeReason,
+    sameModel,
+    cloudflareVerdict,
     redactFrame,
   });
 })(typeof globalThis !== 'undefined' ? globalThis : this);

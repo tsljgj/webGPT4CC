@@ -12,16 +12,19 @@ check the plumbing, not ChatGPT's live DOM. When ChatGPT changes, update the ext
 together.
 
 ```sh
-npm run test:e2e                                          # both files, ~60 s
-node --test --test-reporter=spec test/e2e/fake.test.ts    # the fake alone, ~13 s
-node --test --test-reporter=spec test/e2e/chain.test.ts   # full chain, ~45 s
-E2E_VERBOSE=1 node --test test/e2e/chain.test.ts          # stream bridge, browser and fake logs
+npm run test:e2e                                              # all files, ~2.5 min
+node --test --test-reporter=spec test/e2e/fake.test.ts        # the fake alone, ~13 s
+node --test --test-reporter=spec test/e2e/chain.test.ts       # full chain with claude, ~45 s
+node --test --test-reporter=spec test/e2e/locale.test.ts      # zh-CN UI, 2026-09 composer, ~55 s
+node --test --test-reporter=spec test/e2e/lifecycle.test.ts   # reloads, typing, cancels, ~35 s
+E2E_VERBOSE=1 node --test test/e2e/chain.test.ts              # stream bridge, browser and fake logs
 ```
 
-Both files **skip** (they do not fail) when Playwright's Chromium is not
+All files **skip** (they do not fail) when Playwright's Chromium is not
 installed (`PLAYWRIGHT_BROWSERS_PATH`; nothing here runs `playwright install`).
-The chain test also skips without `extension/manifest.json` or a working
-`claude` CLI. The skip reason is printed next to the suite name.
+The extension tests also skip without `extension/manifest.json`, and the chain
+test without a working `claude` CLI (`locale` and `lifecycle` drive the
+bridge's provider directly). The skip reason is printed next to the suite name.
 
 | Variable | Effect |
 |---|---|
@@ -67,10 +70,26 @@ Chromium build in the new headless mode, which loads MV3 extensions. The default
     catch-ups, a repeated item, an array frame and a `done` envelope.
   - `GET /backend-api/conversation/<id>`, which returns `mapping` and
     `current_node`.
-  - Options: `rateLimit` (HTTP 429 with `detail.clears_in`),
-    `conversationApi: 'cloudflare'` (403 HTML), `loggedIn: false`,
-    `composerMode: 'work'`, `thoughts`, and `sseDelivery` (`'stream'`, the
-    default, or `'whole'`).
+  - Options: `rateLimit` (HTTP 429 with `detail.clears_in`, on the
+    conversation POST or, with `rateLimitAt: 'sentinel'`, on Sentinel's
+    prepare), `conversationApi: 'cloudflare'` (403 HTML), `loggedIn: false`
+    (with `guestComposer: true`: a working guest composer that posts to
+    `/backend-anon/…`, recorded in `anonRequests`), `composerMode: 'work'`,
+    `thoughts`, `sseDelivery` (`'stream'`, the default, or `'whole'`),
+    `uiBanner` (a blocking limit banner), `answerInProgressForMs` (the
+    conversation API reports the answer as `in_progress` for that long),
+    `accountId` (a workspace account: the page sends `Chatgpt-Account-Id`, and
+    the conversation API answers 404 without it), `ignoreModelParam` and
+    `sendTransform` (`'escape-markdown'` or `'truncate-half'`: what a composer
+    serializer could do to the text it sends).
+  - The real-site shape the primary user sees: `locale: 'zh-CN'` (every label
+    localized, no `data-testid`), `composerButton: 'cycle'` (one
+    `type="button"` primary composer button without id whose label cycles voice
+    → send → stop; clicking it while idle starts "voice mode", counted in
+    `__fakeChatGPT.state.voiceStarts`), `labels` (overrides, e.g. texts no
+    selector can know) and `trustedEnterOnly` (synthetic Enter is ignored).
+  - Healthy pages load Cloudflare's `/cdn-cgi/challenge-platform/` script, as
+    the real site does.
   - The scripted LLM has the signature
     `(prompt, { history, turn, conversationId, ... }) => string | FakeReply`.
     A `FakeReply` can add reasoning, a commentary preamble, a transport,
@@ -104,6 +123,22 @@ Chromium build in the new headless mode, which loads MV3 extensions. The default
   - `startChain`, which wires all of the above together; `chain.close()` also
     kills `claude` runs that are still going (after a test timeout).
   - `chromiumSkipReason` and `chainSkipReason`.
+- `locale.test.ts`: the extension against the zh-CN fake with the cycling
+  primary button, unknown send/stop labels and synthetic Enter ignored. Send
+  must use the structural button without starting voice mode; a localized Work
+  switch is set to Chat; a Work turn (unrecognizable switch) is stopped and
+  refused from its request body; cancel stops the reply without knowing the
+  stop label and the next job runs at once; a dropped stream is read back
+  while the answer stays `in_progress` for 17 s; a localized usage-limit banner
+  and a Sentinel 429 become `rate_limited`; a logged-out guest composer never
+  gets the prompt. Also: the bot-management script does not flag the tab as a
+  Cloudflare check.
+- `lifecycle.test.ts`: a navigation that first lands on a self-reloading
+  Cloudflare check; text typed into the worker tab while a job sends; a
+  workspace account's read-back (`Chatgpt-Account-Id`); an ignored `?model=`
+  reported as `model_mismatch`; an escaping composer reported as
+  `prompt_mismatch` (`backslash-escape`); a large prompt sent cut short stopped
+  as `too_long`; a job cancelled while its navigation loads.
 - `fake.test.ts`: tests the fake alone, without the extension.
 - `chain.test.ts`: runs the real `claude` CLI against the bridge, the extension
   and the fake.

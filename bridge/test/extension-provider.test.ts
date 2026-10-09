@@ -3,7 +3,8 @@ import { after, before, describe, it } from 'node:test';
 import WebSocket from 'ws';
 import { defaultConfig, type BridgeConfig } from '../src/config.ts';
 import { silentLogger } from '../src/log.ts';
-import { ExtensionProvider, isAllowedOrigin } from '../src/providers/extension.ts';
+import { randomBytes } from 'node:crypto';
+import { ExtensionProvider, isAllowedOrigin, pairingHmac, PROTOCOL_VERSION } from '../src/providers/extension.ts';
 import type { ChatEvent, ChatJob } from '../src/providers/types.ts';
 import { createBridgeServer, type BridgeServer } from '../src/server.ts';
 
@@ -14,22 +15,44 @@ function job(over: Partial<ChatJob> = {}): ChatJob {
   return { id: `job-${Math.random().toString(36).slice(2)}`, model: '', conversation: { kind: 'new' }, prompt: 'hello', purpose: 'main', timeoutMs: 10_000, ...over };
 }
 
-/** A fake extension: connects, announces workers, and answers jobs with a handler. */
+/**
+ * A fake extension: connects, completes the pairing handshake (hello / welcome /
+ * auth, like extension/background.js), announces workers, and answers jobs with a handler.
+ */
 class FakeExtension {
   ws!: WebSocket;
   readonly received: Array<Record<string, unknown>> = [];
   onJob: (job: Record<string, unknown>, send: (ev: ChatEvent) => void) => void = () => {};
   ackCancel = true;
+  /** Whether the bridge's welcome proof verified with our token. */
+  bridgeProofOk: boolean | undefined;
+  closeCode: number | undefined;
 
-  async connect(url: string, opts: { origin?: string; token?: string } = {}): Promise<number | 'open'> {
+  /** Resolves 'open' once authenticated, the HTTP status of a refused upgrade, or the close code. */
+  async connect(url: string, opts: { origin?: string; token?: string; handshake?: boolean } = {}): Promise<number | 'open'> {
+    const token = opts.token ?? EXT_TOKEN;
+    const nonce = randomBytes(16).toString('hex');
     return new Promise((resolve) => {
-      this.ws = new WebSocket(`${url.replace('http', 'ws')}/extension?token=${opts.token ?? EXT_TOKEN}`, { origin: opts.origin ?? ORIGIN });
+      this.ws = new WebSocket(`${url.replace('http', 'ws')}/extension`, { origin: opts.origin ?? ORIGIN });
       this.ws.on('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0));
-      this.ws.on('open', () => resolve('open'));
+      this.ws.on('open', () => {
+        if (opts.handshake === false) return resolve('open');
+        this.send({ type: 'hello', protocol: PROTOCOL_VERSION, extensionVersion: 'test', nonce });
+      });
+      this.ws.on('close', (code) => {
+        this.closeCode = code;
+        resolve(code);
+      });
       this.ws.on('error', () => {});
       this.ws.on('message', (data) => {
         const msg = JSON.parse(String(data)) as Record<string, unknown>;
         this.received.push(msg);
+        if (msg.type === 'welcome' && typeof msg.nonce === 'string') {
+          this.bridgeProofOk = msg.proof === pairingHmac(token, `bridge|${nonce}|${msg.nonce}`);
+          this.send({ type: 'auth', proof: pairingHmac(token, `extension|${msg.nonce}|${nonce}`) });
+          // The bridge closes at once on a bad proof; otherwise we are in.
+          setTimeout(() => resolve('open'), 60);
+        }
         if (msg.type === 'cancel' && this.ackCancel) {
           // Like the real extension: stop, then report the job's end.
           this.send({ type: 'job_event', jobId: msg.jobId, event: { type: 'error', code: 'aborted', message: 'stopped' } });
@@ -46,8 +69,7 @@ class FakeExtension {
     this.ws.send(JSON.stringify(msg));
   }
 
-  workers(list: Array<{ id: string; ready?: boolean; busy?: boolean }>): void {
-    this.send({ type: 'hello', protocol: 1, extensionVersion: 'test' });
+  workers(list: Array<{ id: string; ready?: boolean; busy?: boolean; conversationId?: string }>): void {
     this.send({ type: 'workers', workers: list.map((w) => ({ ready: true, busy: false, ...w })) });
   }
 
@@ -94,7 +116,26 @@ describe('extension provider', () => {
     const a = new FakeExtension();
     assert.equal(await a.connect(bridge.url(), { origin: 'https://evil.example' }), 403);
     const b = new FakeExtension();
-    assert.equal(await b.connect(bridge.url(), { token: 'wrong' }), 401);
+    assert.equal(await b.connect(bridge.url(), { token: 'wrong' }), 4401);
+    // The bridge's own proof does not verify with the wrong token either: the real
+    // extension refuses such a bridge before it sends anything.
+    assert.equal(b.bridgeProofOk, false);
+    const c = new FakeExtension();
+    assert.equal(await c.connect(bridge.url()), 'open');
+    assert.equal(c.bridgeProofOk, true);
+    c.close();
+    await wait(50);
+  });
+
+  it('ignores everything but the handshake from an unauthenticated peer', async () => {
+    const ext = new FakeExtension();
+    assert.equal(await ext.connect(bridge.url(), { handshake: false }), 'open');
+    ext.workers([{ id: 'sneaky' }]);
+    ext.send({ type: 'auth', proof: 'f'.repeat(64) }); // auth before hello
+    const code = await new Promise<number>((r) => ext.ws.on('close', (c) => r(c)));
+    assert.equal(code, 4400);
+    assert.equal(provider.status().workers.length, 0);
+    assert.equal(ext.received.length, 0, 'no welcome without a hello');
   });
 
   it('runs a job on a connected worker and relays events', async () => {
@@ -124,6 +165,67 @@ describe('extension provider', () => {
     const events = await collect(provider.run(job(), new AbortController().signal));
     const err = events.find((e) => e.type === 'error') as Extract<ChatEvent, { type: 'error' }>;
     assert.equal(err.code, 'no_worker');
+    assert.match(err.message, /extension is not connected/);
+  });
+
+  it('tells an extension without worker tabs apart from no extension', async () => {
+    const ext = new FakeExtension();
+    await ext.connect(bridge.url());
+    ext.workers([]);
+    await wait(50);
+    const events = await collect(provider.run(job(), new AbortController().signal));
+    const err = events.at(-1) as { code: string; message: string };
+    assert.equal(err.code, 'no_worker');
+    assert.match(err.message, /connected but has no worker tab/);
+    ext.close();
+    await wait(50);
+  });
+
+  it('finds the tab holding a conversation after an extension reconnect (new connection id)', async () => {
+    const ext1 = new FakeExtension();
+    await ext1.connect(bridge.url());
+    ext1.workers([{ id: 'a' }, { id: 'b' }]);
+    await wait(50);
+    const oldKey = provider.status().workers.find((w) => w.id.endsWith(':b'))!.id;
+    ext1.close();
+    await wait(50);
+    // The extension reconnects: same tabs, a new connection id. Tab b announces it holds conv-7.
+    const ext2 = new FakeExtension();
+    await ext2.connect(bridge.url());
+    const seen: string[] = [];
+    ext2.onJob = (j, send) => {
+      seen.push(String(j.workerId));
+      send({ type: 'done', text: 'ok', conversationId: 'conv-7' });
+    };
+    ext2.workers([{ id: 'a' }, { id: 'b', conversationId: 'conv-7' }]);
+    await wait(50);
+    assert.ok(!provider.status().workers.some((w) => w.id === oldKey), 'the old worker key is gone');
+    await collect(provider.run(job({ conversation: { kind: 'continue', conversationId: 'conv-7', workerId: oldKey } }), new AbortController().signal));
+    // Without a conversationId announcement, the same tab id on the new connection.
+    await collect(provider.run(job({ conversation: { kind: 'continue', conversationId: 'conv-8', workerId: oldKey } }), new AbortController().signal));
+    assert.deepEqual(seen, ['b', 'b']);
+    ext2.close();
+    await wait(50);
+  });
+
+  it('keeps new chats away from a tab that holds a temporary main-session chat', async () => {
+    const ext = new FakeExtension();
+    await ext.connect(bridge.url());
+    const seen: string[] = [];
+    ext.onJob = (j, send) => {
+      seen.push(String(j.workerId));
+      send({ type: 'done', text: 'ok', conversationId: j.workerId === 't1' ? 'temp-1' : 'other' });
+    };
+    ext.workers([{ id: 't1' }]);
+    await wait(50);
+    await collect(provider.run(job({ temporary: true }), new AbortController().signal));
+    // t1 now holds temporary chat temp-1; a second tab joins.
+    ext.workers([{ id: 't1', conversationId: 'temp-1' }, { id: 't2' }]);
+    await wait(50);
+    await collect(provider.run(job({ purpose: 'web_search', temporary: true }), new AbortController().signal));
+    assert.deepEqual(seen, ['t1', 't2']);
+    ext.close();
+    await wait(50);
   });
 
   it('prefers the worker that holds the conversation, and builds the /c/ URL', async () => {

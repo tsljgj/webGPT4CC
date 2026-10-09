@@ -2,3 +2,4 @@
 // argument; package.json "main" points here). Each file can also run on its own.
 import './stream-core.test.mjs';
 import './manifest.test.mjs';
+import './background.test.mjs';

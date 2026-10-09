@@ -28,22 +28,37 @@ function showError(text) {
 }
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get(['bridgeUrl', 'token', 'enabled', 'debug']);
+  const s = await chrome.storage.local.get(['bridgeUrl', 'token', 'enabled', 'debug', 'allowRemoteBridge']);
   $('bridgeUrl').value = s.bridgeUrl || DEFAULT_BRIDGE_URL;
   $('token').value = s.token || '';
   $('enabled').checked = s.enabled !== false;
   $('debug').checked = s.debug === true;
+  $('allowRemoteBridge').checked = s.allowRemoteBridge === true;
+}
+
+/** Same rule as the service worker (background.js bridgeUrlProblem): unencrypted only to this computer. */
+function isLoopbackHost(hostname) {
+  const h = String(hostname || '')
+    .replace(/^\[|\]$/g, '')
+    .toLowerCase();
+  return h === 'localhost' || h.endsWith('.localhost') || h === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 async function saveSettings(ev) {
   ev.preventDefault();
   let url = $('bridgeUrl').value.trim() || DEFAULT_BRIDGE_URL;
+  const allowRemote = $('allowRemoteBridge').checked;
+  let u;
   try {
-    const u = new URL(url);
-    if (!/^(https?|wss?):$/.test(u.protocol)) throw new Error('bad protocol');
+    u = new URL(url);
+    if (!/^(https?|wss?):$/.test(u.protocol) || u.username || u.password) throw new Error('bad URL');
     url = url.replace(/\/+$/, '');
   } catch {
     showError('The bridge URL must look like http://127.0.0.1:8765');
+    return;
+  }
+  if (!isLoopbackHost(u.hostname) && (u.protocol === 'http:' || u.protocol === 'ws:') && !allowRemote) {
+    showError(`${u.hostname} is not this computer and ${u.protocol}// is unencrypted: use wss:// or https://, or tick "Allow an unencrypted bridge on another computer".`);
     return;
   }
   showError('');
@@ -52,6 +67,7 @@ async function saveSettings(ev) {
     token: $('token').value.trim(),
     enabled: $('enabled').checked,
     debug: $('debug').checked,
+    allowRemoteBridge: allowRemote,
   });
   const saved = $('saved');
   saved.hidden = false;
@@ -62,12 +78,14 @@ async function saveSettings(ev) {
 function describeWorker(w) {
   if (!w.connected) return { cls: 'bad', text: 'page not connected (reload the tab)' };
   if (w.busy) return { cls: 'busy', text: w.phase === 'navigating' ? 'busy: opening the chat' : 'busy: answering' };
+  if (w.ready) return { cls: 'ok', text: w.hidden ? 'ready (background tab: keep it in its own window if replies stall)' : 'ready' };
+  if (w.frozen || w.stale) return { cls: 'bad', text: 'not responding (Chrome may have frozen the tab): show it, or keep chatgpt.com always active' };
   if (w.cloudflare) return { cls: 'warn', text: 'Cloudflare check: open the tab and complete it' };
   if (w.loginRequired) return { cls: 'warn', text: 'not logged in: open the tab and log in' };
   if (w.warning) return { cls: 'warn', text: `ChatGPT: ${w.warning.text}` };
   if (w.generating) return { cls: 'warn', text: 'ChatGPT is still generating' };
+  if (w.userTyping) return { cls: 'warn', text: 'someone is typing in this tab' };
   if (!w.composer) return { cls: 'warn', text: 'waiting for the ChatGPT page' };
-  if (w.ready) return { cls: 'ok', text: w.hidden ? 'ready (background tab: keep it in its own window if replies stall)' : 'ready' };
   return { cls: '', text: 'not ready' };
 }
 

@@ -560,3 +560,163 @@ test('isConversationPath', () => {
   assert.equal(Core.isConversationPath('/backend-api/f/conversation/prepare'), false);
   assert.equal(Core.isResumePath('/backend-api/f/conversation/resume'), true);
 });
+
+// ---------------------------------------------------------------------------
+// localized UI text (the UI language follows the ChatGPT account, e.g. zh-CN)
+
+test('classifyUiWarning: Simplified Chinese, Traditional Chinese and Japanese limit texts', () => {
+  assert.equal(Core.classifyUiWarning('请求过多。我们已暂时限制对你的对话的访问。请稍等几分钟。'), 'rate_limit');
+  assert.equal(Core.classifyUiWarning('请求过多，请稍后再试。'), 'rate_limit');
+  assert.equal(Core.classifyUiWarning('您已达到 GPT-5 的使用上限。你的限额将于 18:30 后重置。'), 'usage_cap');
+  assert.equal(Core.classifyUiWarning('你已用完 GPT-5 Thinking 的额度，额度将在 3 小时后恢复。'), 'usage_cap');
+  assert.equal(Core.classifyUiWarning('請求過多。請稍後再試。'), 'rate_limit');
+  assert.equal(Core.classifyUiWarning('GPT-5 の上限に達しました。'), 'usage_cap');
+  assert.equal(Core.classifyUiWarning('出错了。如果此问题仍然存在，请通过 help.openai.com 联系我们。'), 'temporary_unavailable');
+  assert.equal(Core.classifyUiWarning('请验证您是真人'), 'auth_or_challenge');
+  assert.equal(Core.classifyUiWarning('你的会话已过期，请重新登录。'), 'auth_or_challenge');
+  assert.equal(Core.classifyUiWarning('回复已完成'), null);
+  assert.equal(Core.classifyUiWarning('已复制'), null);
+});
+
+test('parseRetryAfter: Chinese and Japanese relative and clock times', () => {
+  const now = new Date(2026, 9, 9, 15, 0, 0).getTime(); // 15:00 local
+  assert.equal(Core.parseRetryAfter('你的限额将在 20 分钟后重置', now), 20 * 60e3);
+  assert.equal(Core.parseRetryAfter('请在3个小时后再试', now), 3 * 3600e3);
+  assert.equal(Core.parseRetryAfter('1 小時後重置', now), 3600e3);
+  assert.equal(Core.parseRetryAfter('30秒后重试', now), 30e3);
+  assert.equal(Core.parseRetryAfter('20分後にもう一度お試しください', now), 20 * 60e3);
+  assert.equal(Core.parseRetryAfter('你的限额将于 18:30 后重置。', now), 3.5 * 3600e3);
+  assert.equal(Core.parseRetryAfter('限额将于下午6:30重置', now), 3.5 * 3600e3);
+  assert.equal(Core.parseRetryAfter('额度将于上午 9：05 恢复', now), 18 * 3600e3 + 5 * 60e3);
+  assert.equal(Core.parseRetryAfter('请稍后再试', now), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// page-level stream tracking, Work mode, models, Cloudflare
+
+test('scanStreamEvent finds completion, [DONE] and handoff topics without parsing other frames', () => {
+  assert.deepEqual(Core.scanStreamEvent({ data: '[DONE]' }), { complete: false, done: true, topics: [] });
+  assert.deepEqual(Core.scanStreamEvent({ data: JSON.stringify({ type: 'message_stream_complete', conversation_id: 'c' }) }), { complete: true, done: false, topics: [] });
+  assert.deepEqual(
+    Core.scanStreamEvent({ data: JSON.stringify({ type: 'stream_handoff', options: [{ type: 'subscribe_ws_topic', topic_id: 'conversation-turn-1' }] }) }),
+    { complete: false, done: false, topics: ['conversation-turn-1'] },
+  );
+  // The words inside a reply's text are not markers.
+  assert.deepEqual(Core.scanStreamEvent({ data: JSON.stringify({ v: 'type message_stream_complete stream_handoff' }) }), { complete: false, done: false, topics: [] });
+  assert.deepEqual(Core.scanStreamEvent({ data: '{broken message_stream_complete' }), { complete: false, done: false, topics: [] });
+  assert.deepEqual(Core.scanStreamEvent(null), { complete: false, done: false, topics: [] });
+});
+
+test('reducer keeps product_experience and requested_model_experience from server_ste_metadata', () => {
+  const st = run(sse([{ type: 'server_ste_metadata', metadata: { model_slug: 'gpt-6-luna-wm', product_experience: 'work', requested_model_experience: 'work' } }]));
+  const snap = st.snapshot();
+  assert.equal(snap.modelSlug, 'gpt-6-luna-wm');
+  assert.equal(snap.productExperience, 'work');
+  assert.equal(snap.requestedModelExperience, 'work');
+});
+
+test('workModeReason: request body, stream metadata, Work model slugs and WEB: conversation ids', () => {
+  assert.match(Core.workModeReason({ conversationMode: 'work' }), /conversation_mode/);
+  assert.match(Core.workModeReason({ productExperience: 'work' }), /product_experience/);
+  assert.match(Core.workModeReason({ requestedModelExperience: 'work' }), /requested_model_experience/);
+  assert.match(Core.workModeReason({ model: 'gpt-6-sol-wm' }), /Work model/);
+  assert.match(Core.workModeReason({ slug: 'gpt-6-luna-wm-2026-09' }), /Work model/);
+  assert.match(Core.workModeReason({ conversationId: 'WEB:0d3c-11' }), /Work conversation/);
+  assert.match(Core.workModeReason({ conversationId: 'WEB%3A0d3c-11' }), /Work conversation/);
+  assert.equal(Core.workModeReason({ conversationMode: 'primary_assistant', productExperience: 'chat', requestedModelExperience: 'thinking', model: 'gpt-5-6-thinking', slug: 'gpt-5-wmx', conversationId: '68e5-uuid' }), null);
+  assert.equal(Core.workModeReason(undefined), null);
+});
+
+test('composerModeOf: value attributes first, then localized labels', () => {
+  assert.equal(Core.composerModeOf('work', '聊天'), 'work');
+  assert.equal(Core.composerModeOf('', 'Work'), 'work');
+  assert.equal(Core.composerModeOf(null, ' 工作 '), 'work');
+  assert.equal(Core.composerModeOf(null, 'ワーク'), 'work');
+  assert.equal(Core.composerModeOf(null, '聊天'), 'chat');
+  assert.equal(Core.composerModeOf(null, 'チャット'), 'chat');
+  assert.equal(Core.composerModeOf('chat', ''), 'chat');
+  assert.equal(Core.composerModeOf(null, 'Thinking'), null);
+});
+
+test('sameModel compares model names loosely', () => {
+  assert.equal(Core.sameModel('gpt-5.5', 'GPT-5-5'), true);
+  assert.equal(Core.sameModel('gpt-5-thinking', 'gpt-5-thinking'), true);
+  assert.equal(Core.sameModel('gpt-5-thinking', 'auto'), false);
+  assert.equal(Core.sameModel('gpt-5-thinking', ''), false);
+});
+
+test('cloudflareVerdict: the bot-management script alone is weak evidence, the app shell wins', () => {
+  // A healthy ChatGPT page also loads /cdn-cgi/challenge-platform/... (oracle, 2026-07).
+  assert.deepEqual(Core.cloudflareVerdict({ title: 'ChatGPT', bodyText: 'x'.repeat(5000), hasAppShell: true, hasChallengeScript: true }), { strong: false, shell: true, weak: false });
+  assert.deepEqual(Core.cloudflareVerdict({ title: 'Just a moment...', bodyText: 'Checking your browser', hasAppShell: false }), { strong: true, shell: false, weak: false });
+  assert.equal(Core.cloudflareVerdict({ title: '请稍候…', bodyText: '', hasAppShell: false }).strong, true);
+  assert.equal(Core.cloudflareVerdict({ title: 'chatgpt.com', bodyText: '正在验证您是否是真人。这可能需要几秒钟时间。', hasAppShell: false }).strong, true);
+  assert.equal(Core.cloudflareVerdict({ title: '', bodyText: '', hasAppShell: false, hasChallengeWidget: true }).strong, true);
+  assert.deepEqual(Core.cloudflareVerdict({ title: '', bodyText: 'Loading', hasAppShell: false, hasChallengeScript: true }), { strong: false, shell: false, weak: true });
+  assert.deepEqual(Core.cloudflareVerdict({ title: 'Just a moment...', bodyText: '', hasAppShell: true }), { strong: false, shell: true, weak: false });
+});
+
+test('isSendPipelinePath: Sentinel and conduit prepare, not the conversation itself', () => {
+  assert.equal(Core.isSendPipelinePath('/backend-api/sentinel/chat-requirements'), true);
+  assert.equal(Core.isSendPipelinePath('/backend-api/sentinel/chat-requirements/prepare'), true);
+  assert.equal(Core.isSendPipelinePath('/backend-api/sentinel/chat-requirements/finalize'), true);
+  assert.equal(Core.isSendPipelinePath('/backend-api/f/conversation/prepare'), true);
+  assert.equal(Core.isSendPipelinePath('/backend-api/f/conversation'), false);
+  assert.equal(Core.isSendPipelinePath('/backend-api/conversations'), false);
+});
+
+// ---------------------------------------------------------------------------
+// prompt fidelity
+
+test('comparePromptFidelity: exact match, outer whitespace tolerated', () => {
+  assert.equal(Core.comparePromptFidelity('a\tb  \n\\x', 'a\tb  \n\\x'), null);
+  assert.equal(Core.comparePromptFidelity('hello\nworld', 'hello\r\nworld\n\n'), null);
+  assert.equal(Core.comparePromptFidelity('  hello', 'hello'), null);
+});
+
+test('comparePromptFidelity classifies what changed and where', () => {
+  const want = '12\tconst a = b * c;  \nnext \\ line';
+  const r1 = Core.comparePromptFidelity('12    const a = b * c;  \nnext \\ line', want);
+  assert.deepEqual(r1.kinds, ['tabs-or-spaces']);
+  assert.equal(r1.offset, 2);
+  assert.deepEqual(Core.comparePromptFidelity('12\tconst a = b * c;\nnext \\ line', want).kinds, ['trailing-whitespace']);
+  assert.deepEqual(Core.comparePromptFidelity('12\tconst a = b \\* c;  \nnext \\\\ line', want).kinds, ['backslash-escape']);
+  assert.deepEqual(Core.comparePromptFidelity('a b', 'a b').kinds, ['nbsp']);
+  assert.deepEqual(Core.comparePromptFidelity('a\n\nb', 'a\n\n\n\nb').kinds, ['blank-lines']);
+  assert.deepEqual(Core.comparePromptFidelity('12 const a = b \\* c;\nnext \\\\ line', want).kinds, ['backslash-escape', 'trailing-whitespace', 'tabs-or-spaces']);
+  assert.deepEqual(Core.comparePromptFidelity('something else entirely', want).kinds, ['other']);
+  const cut = Core.comparePromptFidelity('x'.repeat(60_000), 'x'.repeat(70_000));
+  assert.deepEqual(cut, { offset: 60_000, sentChars: 60_000, wantChars: 70_000, kinds: ['truncated'] });
+});
+
+// ---------------------------------------------------------------------------
+// conversation document: pinning the answer to our own user message
+
+test('answerFromConversation pins the turn by user message id or prompt text', () => {
+  const node = (id, parent, message) => ({ id, parent, children: [], message });
+  const user = (id, text) => ({ id, author: { role: 'user' }, content: { content_type: 'text', parts: [text] } });
+  const answer = (id, text, extra = {}) => msg(id, { channel: 'final', content: { content_type: 'text', parts: [text] }, status: 'finished_successfully', end_turn: true, ...extra });
+  const doc = {
+    conversation_id: 'conv-y',
+    current_node: 'a2',
+    mapping: {
+      u1: node('u1', null, user('u1', 'first prompt')),
+      a1: node('a1', 'u1', answer('a1', 'first answer')),
+      u2: node('u2', 'a1', user('u2', 'second   prompt with \\* escapes')),
+      a2: node('a2', 'u2', answer('a2', 'second answer', { status: 'in_progress', end_turn: null })),
+    },
+  };
+  // Our message is the latest one: its (unfinished) answer.
+  const r = Core.answerFromConversation(doc, { userMessageId: 'u2' });
+  assert.equal(r.text, 'second answer');
+  assert.equal(r.finished, false);
+  // An earlier turn by id: only the messages up to the next user message count.
+  assert.equal(Core.answerFromConversation(doc, { userMessageId: 'u1' }).text, 'first answer');
+  // By prompt text (loose: whitespace runs and backslash escapes ignored).
+  assert.equal(Core.answerFromConversation(doc, { prompt: 'second prompt with * escapes' }).text, 'second answer');
+  // Our message never reached the conversation: never the previous turn's answer.
+  assert.deepEqual(Core.answerFromConversation({ ...doc, current_node: 'a1' }, { userMessageId: 'u-ours', prompt: 'my new prompt' }).userMissing, true);
+  assert.equal(Core.answerFromConversation({ ...doc, current_node: 'a1' }, { prompt: 'my new prompt' }).userMissing, true);
+  // Without opts: the latest turn, as before.
+  assert.equal(Core.answerFromConversation(doc).text, 'second answer');
+});

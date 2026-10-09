@@ -39,6 +39,9 @@
             <input id="debug" type="checkbox" /> Debug log
           </label>
         </div>
+        <label class="check" title="Only needed for a bridge on another computer without wss:// or https://. Prompts and replies then cross the network unencrypted.">
+          <input id="allowRemoteBridge" type="checkbox" /> Allow an unencrypted bridge on another computer
+        </label>
         <div class="row">
           <button type="submit">Save</button>
           <button id="reconnect" type="button" class="secondary">Reconnect</button>

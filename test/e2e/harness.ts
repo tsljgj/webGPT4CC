@@ -21,6 +21,7 @@
 // Environment knobs: E2E_VERBOSE=1 (stream bridge/browser/fake logs to stderr),
 // E2E_HEADED=1, E2E_EXTENSION_DIR=/path/to/unpacked/extension, CLAUDE_BIN=/path/to/claude.
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -98,6 +99,12 @@ export function chromiumSkipReason(): string | false {
 export function claudeAvailable(): boolean {
   const r = spawnSync(CLAUDE_BIN, ['--version'], { encoding: 'utf8', timeout: 20_000 });
   return r.status === 0;
+}
+
+/** Reason to skip tests that drive the extension directly through the provider (no claude CLI), or false. */
+export function extensionSkipReason(): string | false {
+  if (!extensionAvailable()) return `no ${join(EXTENSION_DIR, 'manifest.json')} yet (the extension is not built)`;
+  return chromiumSkipReason();
 }
 
 /** Reason to skip the full-chain tests, or false. */
@@ -424,4 +431,61 @@ export async function startChain(opts: { fake?: Partial<FakeOptions>; bridge?: P
     await closeAll();
     throw new Error(`could not start the e2e chain: ${(e as Error).message}\n${report}`);
   }
+}
+
+// ------------------------------------------------- jobs without the claude CLI
+
+/** A provider job like the bridge's handler builds (for tests that drive the provider directly). */
+export function newJob(over: Partial<ChatJob> = {}): ChatJob {
+  return {
+    id: randomUUID(),
+    model: '',
+    conversation: { kind: 'new' },
+    prompt: 'hello from the e2e test',
+    purpose: 'main',
+    timeoutMs: 120_000,
+    temporary: false,
+    allowWebSearch: false,
+    ...over,
+  } as ChatJob;
+}
+
+export interface TimedEvent {
+  /** Milliseconds since the job was started. */
+  t: number;
+  ev: ChatEvent;
+}
+
+/** Run one job through the provider and collect its events (with timestamps) until done or error. */
+export async function runProviderJob(provider: ExtensionProvider, job: ChatJob, signal: AbortSignal = new AbortController().signal): Promise<TimedEvent[]> {
+  const t0 = Date.now();
+  const events: TimedEvent[] = [];
+  for await (const ev of provider.run(job, signal)) {
+    events.push({ t: Date.now() - t0, ev });
+    if (ev.type === 'done' || ev.type === 'error') break;
+  }
+  return events;
+}
+
+/** The final event of a job (done or error). */
+export function finalEvent(events: TimedEvent[]): ChatEvent {
+  const last = events.at(-1);
+  if (!last) throw new Error('the job produced no events');
+  return last.ev;
+}
+
+/** One-line summary of a job's events, for assertion messages. */
+export function describeEvents(events: TimedEvent[]): string {
+  return events
+    .map(({ t, ev }) => {
+      const e = ev as Record<string, unknown>;
+      const extra = e.type === 'status' ? String(e.status) : e.type === 'error' ? `${String(e.code)}: ${String(e.message)}` : e.type === 'done' ? String(e.text).slice(0, 40) : '';
+      return `${t}ms ${String(e.type)} ${extra}`;
+    })
+    .join(' | ');
+}
+
+/** The fake page's own counters (window.__fakeChatGPT.state). */
+export function fakePageState(page: Page): Promise<{ voiceStarts: number; stops: number; anonSends: number; generating: boolean; mode: string }> {
+  return page.evaluate(() => (window as unknown as { __fakeChatGPT: { state: { voiceStarts: number; stops: number; anonSends: number; generating: boolean; mode: string } } }).__fakeChatGPT.state);
 }

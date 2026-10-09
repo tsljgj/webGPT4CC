@@ -14,7 +14,9 @@ const manifest = JSON.parse(read('manifest.json'));
 test('manifest: MV3 with the documented permissions', () => {
   assert.equal(manifest.manifest_version, 3);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
-  assert.deepEqual([...manifest.permissions].sort(), ['alarms', 'storage', 'tabs']);
+  // No "tabs": the chatgpt.com host permission already reveals the URLs we need, and
+  // "tabs" would hand the service worker every site's URL (and a browsing-history warning).
+  assert.deepEqual([...manifest.permissions].sort(), ['alarms', 'storage']);
   assert.deepEqual([...manifest.host_permissions].sort(), ['http://127.0.0.1/*', 'http://localhost/*', 'https://chatgpt.com/*']);
   assert.equal(manifest.background.service_worker, 'background.js');
   assert.equal(manifest.action.default_popup, 'popup.html');

@@ -80,6 +80,38 @@ export interface FakeOptions {
   conversationApi: 'ok' | 'cloudflare';
   /** Model slug reported in stream metadata when the request says "auto". */
   modelSlug: string;
+  /** UI language: every label is localized ('zh-CN' also renders no data-testid). */
+  locale: 'en-US' | 'zh-CN';
+  /**
+   * 'send': type="submit" "Send prompt" plus a separate "Stop" button (older builds).
+   * 'cycle': the 2026-09 primary composer button (type="button", no id / test id) whose
+   * localized label cycles voice -> send -> stop; clicking it while idle starts voice mode.
+   */
+  composerButton: 'send' | 'cycle';
+  /** The composer ignores synthetic (untrusted) Enter keys. */
+  trustedEnterOnly: boolean;
+  /** Label overrides, e.g. { stop: '…' } with a text no selector can know. */
+  labels: Record<string, string>;
+  /** Logged out: show a working guest composer (it posts to /backend-anon/…) next to the login buttons. */
+  guestComposer: boolean;
+  /** A blocking banner (role="alert") with this text; the UI does not send while it shows. */
+  uiBanner: string | null;
+  /** Where `rateLimit` answers 429: the conversation POST, or Sentinel's chat-requirements/prepare. */
+  rateLimitAt: 'conversation' | 'sentinel';
+  /**
+   * GET /backend-api/conversation/{id} reports the latest answer as still in progress
+   * (partial text, status "in_progress") until this long after its POST.
+   */
+  answerInProgressForMs: number;
+  /**
+   * A workspace (Team/Business) account: the page sends this Chatgpt-Account-Id, and
+   * GET /backend-api/conversation/{id} answers 404 without it (looked up under the personal account).
+   */
+  accountId: string | null;
+  /** The page ignores ?model= and sends "auto" (as the new UI may). */
+  ignoreModelParam: boolean;
+  /** What the composer's serializer does to the text it sends (the POST's parts[0]). */
+  sendTransform: 'none' | 'escape-markdown' | 'truncate-half';
   /** Delay between WebSocket frames in handoff mode. */
   wsFrameDelayMs: number;
   /** Stream items sent as subscribe catch-ups (the first of the live items repeats the last catch-up). */
@@ -140,6 +172,8 @@ export interface FakeConversation {
   messages: StoredMessage[];
   currentNode: string;
   turns: Array<{ prompt: string; reply: string }>;
+  /** GET reports the last answer as in progress until this time (answerInProgressForMs). */
+  inProgressUntil?: number;
 }
 
 interface PendingTopic {
@@ -162,6 +196,8 @@ export class FakeChatGPT {
   readonly wsSubscriptions: Array<{ topicId: string; at: number }> = [];
   /** Every handled HTTP request ("METHOD /path STATUS"). */
   readonly httpLog: string[] = [];
+  /** Logged-out guest sends (POST /backend-anon/f/conversation). */
+  readonly anonRequests: string[] = [];
   readonly accessToken = `fake-access-token-${randomUUID()}`;
   private readonly topics = new Map<string, PendingTopic>();
   private seq = 0;
@@ -179,6 +215,17 @@ export class FakeChatGPT {
       pasteChipThreshold: 10_000,
       conversationApi: 'ok',
       modelSlug: 'gpt-5-6-thinking',
+      locale: 'en-US',
+      composerButton: 'send',
+      trustedEnterOnly: false,
+      labels: {},
+      guestComposer: false,
+      uiBanner: null,
+      rateLimitAt: 'conversation',
+      answerInProgressForMs: 0,
+      accountId: null,
+      ignoreModelParam: false,
+      sendTransform: 'none',
       wsFrameDelayMs: 25,
       wsCatchups: 3,
       log: false,
@@ -277,6 +324,11 @@ export class FakeChatGPT {
       await route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: readFileSync(join(HERE, 'app.js'), 'utf8') });
       return 200;
     }
+    // Cloudflare bot management, loaded by healthy pages too (an empty script here).
+    if (path.startsWith('/cdn-cgi/')) {
+      await route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: '/* bot management */' });
+      return 200;
+    }
     if (path === '/favicon.ico' || path.startsWith('/cdn/')) return this.json(route, 404, { detail: 'Not found' });
 
     if (path === '/api/auth/session') {
@@ -287,6 +339,11 @@ export class FakeChatGPT {
         accessToken: this.accessToken,
         authProvider: 'auth0',
       });
+    }
+
+    if (path.startsWith('/backend-anon/')) {
+      this.anonRequests.push(req.postData() ?? '');
+      return this.json(route, 200, { detail: 'guest conversation (fake)' });
     }
 
     if (path.startsWith('/backend-api/')) {
@@ -300,6 +357,15 @@ export class FakeChatGPT {
         composerMode: this.options.composerMode,
         hydrationDelayMs: this.options.hydrationDelayMs,
         pasteChipThreshold: this.options.pasteChipThreshold,
+        locale: this.options.locale,
+        composerButton: this.options.composerButton,
+        trustedEnterOnly: this.options.trustedEnterOnly,
+        labels: this.options.labels,
+        guestComposer: this.options.guestComposer,
+        uiBanner: this.options.uiBanner,
+        accountId: this.options.accountId,
+        ignoreModelParam: this.options.ignoreModelParam,
+        sendTransform: this.options.sendTransform,
       };
       const html = readFileSync(join(HERE, 'index.html'), 'utf8').replace(
         '<!--FAKE_CONFIG-->',
@@ -316,6 +382,13 @@ export class FakeChatGPT {
     const req = route.request();
 
     // The Sentinel / prepare calls the real page makes before every send.
+    if (method === 'POST' && path === '/backend-api/sentinel/chat-requirements/prepare' && this.options.rateLimit && this.options.rateLimitAt === 'sentinel')
+      return this.json(
+        route,
+        429,
+        { detail: { message: this.options.rateLimit.message ?? 'Too many requests', code: 'rate_limit_exceeded', clears_in: this.options.rateLimit.clearsInSec ?? 3600 } },
+        { 'retry-after': String(this.options.rateLimit.clearsInSec ?? 3600) },
+      );
     if (method === 'POST' && path === '/backend-api/sentinel/chat-requirements/prepare')
       return this.json(route, 200, { persona: 'chatgpt-paid', prepare_token: `prep-${this.seq++}`, proofofwork: { required: false }, turnstile: { required: false } });
     if (method === 'POST' && path === '/backend-api/sentinel/chat-requirements/finalize') return this.json(route, 200, { token: `gAAAAAB-fake-${this.seq++}` });
@@ -349,7 +422,8 @@ export class FakeChatGPT {
         return 403;
       }
       const conv = this.conversations.get(decodeURIComponent(m[1]!));
-      if (!conv) return this.json(route, 404, { detail: { code: 'conversation_not_found', message: "Can't load conversation" } });
+      const wrongAccount = !!this.options.accountId && req.headers()['chatgpt-account-id'] !== this.options.accountId;
+      if (!conv || wrongAccount) return this.json(route, 404, { detail: { code: 'conversation_not_found', message: "Can't load conversation" } });
       return this.json(route, 200, this.conversationJson(conv));
     }
 
@@ -361,10 +435,23 @@ export class FakeChatGPT {
     const mapping: Record<string, unknown> = {
       'client-created-root': { id: 'client-created-root', message: null, parent: null, children: conv.messages.length ? [conv.messages[0]!.id] : [] },
     };
+    const inProgress = !!conv.inProgressUntil && Date.now() < conv.inProgressUntil;
     conv.messages.forEach((msg, i) => {
+      // Still generating on the server: the latest answer is partial and in_progress.
+      const last = inProgress && msg.id === conv.currentNode;
+      const parts = (msg.content as { parts?: unknown[] }).parts;
+      const shown = last
+        ? {
+            ...msg,
+            status: 'in_progress',
+            end_turn: null,
+            content: { ...msg.content, parts: [String(parts?.[0] ?? '').slice(0, Math.floor(String(parts?.[0] ?? '').length / 2))] },
+            metadata: { ...(msg.metadata as Record<string, unknown>), finish_details: undefined, is_complete: false },
+          }
+        : msg;
       mapping[msg.id] = {
         id: msg.id,
-        message: msg,
+        message: shown,
         parent: i === 0 ? 'client-created-root' : conv.messages[i - 1]!.id,
         children: i + 1 < conv.messages.length ? [conv.messages[i + 1]!.id] : [],
       };
@@ -421,7 +508,7 @@ export class FakeChatGPT {
     };
     this.requests.push(rec);
 
-    if (this.options.rateLimit) {
+    if (this.options.rateLimit && this.options.rateLimitAt === 'conversation') {
       const clears = this.options.rateLimit.clearsInSec ?? 3600;
       return this.jsonFor(rec, route, 429, {
         detail: {
@@ -496,6 +583,7 @@ export class FakeChatGPT {
       userMessage,
       assistantMessageId,
       modelSlug: work ? 'gpt-6-luna-wm' : !rec.model || rec.model === 'auto' ? this.options.modelSlug : rec.model,
+      productExperience: work ? 'work' : 'chat',
       answer: reply.text,
       finishReason: reply.finishReason ?? 'stop',
       thoughts,
@@ -513,6 +601,7 @@ export class FakeChatGPT {
     conv.messages.push(userMessage, ...rest);
     conv.currentNode = assistantMessageId;
     conv.turns.push({ prompt, reply: reply.text });
+    conv.inProgressUntil = this.options.answerInProgressForMs ? Date.now() + this.options.answerInProgressForMs : undefined;
     Object.assign(rec, {
       responseConversationId: conv.id,
       userMessageId: userMessage.id,

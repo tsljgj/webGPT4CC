@@ -21,20 +21,114 @@
   'use strict';
 
   const CONFIG = Object.assign(
-    { composerMode: 'chat', hydrationDelayMs: 300, pasteChipThreshold: 10000 },
+    {
+      composerMode: 'chat',
+      hydrationDelayMs: 300,
+      pasteChipThreshold: 10000,
+      // 'en-US' or 'zh-CN': the real site localizes every label and drops data-testid in the 2026-09 layout.
+      locale: 'en-US',
+      // 'send': a type="submit" "Send prompt" button plus a separate "Stop" button (older builds).
+      // 'cycle': the 2026-09 primary composer button: type="button", no id / test id, one element
+      // whose localized label cycles voice -> send -> stop (clicking it while idle starts voice mode).
+      composerButton: 'send',
+      // Ignore synthetic (untrusted) Enter key events, like a keymap that checks isTrusted.
+      trustedEnterOnly: false,
+      // Label overrides (keys of LABELS), e.g. labels nobody can know in advance.
+      labels: {},
+      // Logged out: show the guest composer (sends to /backend-anon/...) next to the login buttons.
+      guestComposer: false,
+      // A blocking banner (role="alert") with this text; sending does nothing while it shows.
+      uiBanner: null,
+      // Workspace (Team/Business) account: the page sends Chatgpt-Account-Id on its requests.
+      accountId: null,
+      // The page ignores ?model= (sends "auto"), as the new UI may.
+      ignoreModelParam: false,
+      // What the composer's serializer does to the text it sends: 'none', 'escape-markdown'
+      // (a markdown composer escaping \ * _), or 'truncate-half' (a message cut to size).
+      sendTransform: 'none',
+    },
     window.__FAKE_CHATGPT__ || {},
   );
+  const LABELS = {
+    'en-US': {
+      voice: 'Start Voice',
+      send: 'Send prompt',
+      stop: 'Stop',
+      dictate: 'Start dictation',
+      modeGroup: 'Composer mode',
+      chat: 'Chat',
+      work: 'Work',
+      placeholder: 'Ask ChatGPT',
+      removeChip: 'Remove Pasted text',
+      login: 'Log in',
+      signup: 'Sign up for free',
+      copy: 'Copy',
+      rate: 'Rate response',
+      regenerate: 'Regenerate response',
+      share: 'Share',
+      responseComplete: 'Response complete',
+      said: 'ChatGPT said:',
+      retry: 'Retry',
+      newChat: 'New chat',
+      model: 'Select ChatGPT model',
+      tooMany: 'Too many requests. Please try again later.',
+      wentWrong: 'Something went wrong. If this issue persists please contact us through our help center at help.openai.com.',
+      networkLost: 'Something went wrong. Network connection lost.',
+      interrupted: 'Network error. The response was interrupted.',
+      notFound: 'Unable to load conversation. Conversation not found.',
+      loadFailed: 'Unable to load conversation.',
+      voiceMode: 'Voice mode',
+      loginTitle: 'Get smarter responses, upload files and images, and more.',
+    },
+    'zh-CN': {
+      voice: '开始语音',
+      send: '发送提示',
+      stop: '停止流式传输',
+      dictate: '听写',
+      modeGroup: '输入框模式',
+      chat: '聊天',
+      work: '工作',
+      placeholder: '有问题，尽管问',
+      removeChip: '移除粘贴的文本',
+      login: '登录',
+      signup: '免费注册',
+      copy: '复制',
+      rate: '评价回复',
+      regenerate: '重新生成',
+      share: '共享',
+      responseComplete: '回复已完成',
+      said: 'ChatGPT 说：',
+      retry: '重试',
+      newChat: '新聊天',
+      model: '选择 ChatGPT 模型',
+      tooMany: '请求过多。请稍后再试。',
+      wentWrong: '出错了。如果此问题仍然存在，请通过 help.openai.com 联系我们。',
+      networkLost: '出错了。网络连接已断开。',
+      interrupted: '网络错误。回复已中断。',
+      notFound: '无法加载对话。找不到对话。',
+      loadFailed: '无法加载对话。',
+      voiceMode: '语音模式',
+      loginTitle: '获取更智能的回复，上传文件和图片，以及更多功能。',
+    },
+  };
+  const L = Object.assign({}, LABELS[CONFIG.locale] || LABELS['en-US'], CONFIG.labels || {});
+  // The 2026-09 layout renders no data-testid (and the zh-CN UI here never does).
+  const TESTIDS = CONFIG.locale === 'en-US' && CONFIG.composerButton !== 'cycle';
+  const tid = (id) => (TESTIDS ? id : null);
   const params = new URLSearchParams(location.search);
   const state = {
     token: null,
     temporary: params.get('temporary-chat') === 'true',
-    model: params.get('model') || 'auto',
+    model: (!CONFIG.ignoreModelParam && params.get('model')) || 'auto',
     mode: CONFIG.composerMode === 'work' ? 'work' : 'chat',
     conversationId: null,
     currentNode: null,
     turnCount: 0,
     generating: null,
     chips: [],
+    voiceStarts: 0,
+    stops: 0,
+    anonSends: 0,
     deviceId: crypto.randomUUID(),
     loadedAt: Date.now(),
   };
@@ -54,7 +148,12 @@
     return el;
   }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const authHeaders = () => ({ authorization: `Bearer ${state.token}`, 'oai-device-id': state.deviceId, 'oai-language': 'en-US' });
+  const authHeaders = () => ({
+    authorization: `Bearer ${state.token}`,
+    'oai-device-id': state.deviceId,
+    'oai-language': CONFIG.locale,
+    ...(CONFIG.accountId ? { 'chatgpt-account-id': CONFIG.accountId } : {}),
+  });
 
   async function api(method, path, body) {
     const r = await fetch(path, {
@@ -67,7 +166,7 @@
   }
 
   function toast(text) {
-    const t = h('div', { class: 'toast', role: 'alert', 'data-testid': 'toast' }, text);
+    const t = h('div', { class: 'toast', role: 'alert', 'data-testid': tid('toast') }, text);
     document.body.append(t);
     setTimeout(() => t.remove(), 8000);
   }
@@ -285,7 +384,7 @@
   /** Render the canonical shape of `paras` into an arbitrary element (no side effects). */
   function renderShape(target) {
     if (paras.length === 1 && paras[0] === '') {
-      target.append(h('p', { 'data-empty-paragraph': 'true', 'data-placeholder': 'Ask ChatGPT', class: 'placeholder' }, h('br', { class: 'ProseMirror-trailingBreak' })));
+      target.append(h('p', { 'data-empty-paragraph': 'true', 'data-placeholder': L.placeholder, class: 'placeholder' }, h('br', { class: 'ProseMirror-trailingBreak' })));
       return;
     }
     for (const text of paras) {
@@ -308,13 +407,13 @@
     const id = crypto.randomUUID();
     const chip = h(
       'div',
-      { class: 'chip', 'data-testid': 'attachment-chip' },
+      { class: 'chip', 'data-testid': tid('attachment-chip') },
       h('span', {}, 'Pasted text'),
       h(
         'button',
         {
           type: 'button',
-          'aria-label': 'Remove Pasted text',
+          'aria-label': L.removeChip,
           onclick: () => {
             state.chips = state.chips.filter((c) => c.id !== id);
             chip.remove();
@@ -329,17 +428,51 @@
     updateSubmit();
   }
 
+  /** 'cycle' layout: what the single primary button does right now. */
+  const primaryMode = () => (state.generating ? 'stop' : isEmpty() && state.chips.length === 0 ? 'voice' : 'send');
+
+  function onPrimary() {
+    const mode = primaryMode();
+    if (mode === 'stop') stop();
+    else if (mode === 'send') submit();
+    else startVoice();
+  }
+
+  function startVoice() {
+    // Voice mode (asks for the microphone on the real site): must never be started by automation.
+    state.voiceStarts++;
+    const d = h('div', { role: 'dialog', class: 'toast', 'aria-label': L.voiceMode }, L.voiceMode);
+    document.body.append(d);
+    setTimeout(() => d.remove(), 3000);
+  }
+
   function updateSubmit() {
     if (!submitSlot) return;
     const cur = submitSlot.firstElementChild;
+    if (CONFIG.composerButton === 'cycle') {
+      // One element whose label (and action) cycles, like the 2026-09 primary composer button.
+      let btn = cur;
+      if (!btn) {
+        btn = h('button', {
+          type: 'button',
+          class: 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-full transition-opacity bg-composer-primary p-0.5',
+          onclick: onPrimary,
+        });
+        submitSlot.replaceChildren(btn);
+      }
+      const mode = primaryMode();
+      btn.setAttribute('aria-label', L[mode]);
+      btn.textContent = mode === 'stop' ? '■' : mode === 'send' ? '↑' : '🎙';
+      return;
+    }
     if (state.generating) {
-      if (!cur || cur.getAttribute('aria-label') !== 'Stop')
-        submitSlot.replaceChildren(h('button', { type: 'button', 'aria-label': 'Stop', class: 'stop-btn', onclick: stop }, '■'));
+      if (!cur || cur.getAttribute('aria-label') !== L.stop)
+        submitSlot.replaceChildren(h('button', { type: 'button', 'aria-label': L.stop, class: 'stop-btn', onclick: stop }, '■'));
       return;
     }
     let send = cur;
-    if (!cur || cur.getAttribute('aria-label') !== 'Send prompt') {
-      send = h('button', { type: 'submit', 'aria-label': 'Send prompt', id: 'composer-submit-button', class: 'send-btn' }, '↑');
+    if (!cur || cur.getAttribute('aria-label') !== L.send) {
+      send = h('button', { type: 'submit', 'aria-label': L.send, id: 'composer-submit-button', class: 'send-btn' }, '↑');
       submitSlot.replaceChildren(send);
     }
     send.disabled = isEmpty() && state.chips.length === 0;
@@ -348,7 +481,7 @@
   function setMode(mode) {
     state.mode = mode;
     for (const b of modeGroup.querySelectorAll('button')) {
-      const on = b.textContent === (mode === 'work' ? 'Work' : 'Chat');
+      const on = b.textContent === (mode === 'work' ? L.work : L.chat);
       b.setAttribute('aria-pressed', String(on));
       b.setAttribute('data-state', on ? 'on' : 'off');
     }
@@ -426,7 +559,7 @@
         h(
           'div',
           unitAttrs(turn, msgId),
-          h('h4', { class: 'sr-only', 'data-conversation-role': 'assistant' }, 'ChatGPT said:'),
+          h('h4', { class: 'sr-only', 'data-conversation-role': 'assistant' }, L.said),
           h('div', { class: 'group flex min-w-0 flex-col', 'data-chatgpt-selection-conversation-id': state.conversationId || '', 'data-chatgpt-selection-message-id': msgId }, turn.answerRoot),
         ),
       );
@@ -450,17 +583,17 @@
       h(
         'div',
         { class: 'turn-action-controls' },
-        h('button', { type: 'button', 'aria-label': 'Copy', onclick: copy }, 'Copy'),
-        h('button', { type: 'button', 'aria-label': 'Rate response' }, 'Rate'),
-        h('button', { type: 'button', 'aria-label': 'Regenerate response' }, 'Regenerate'),
-        h('button', { type: 'button', 'aria-label': 'Share' }, 'Share'),
+        h('button', { type: 'button', 'aria-label': L.copy, onclick: copy }, L.copy),
+        h('button', { type: 'button', 'aria-label': L.rate }, L.rate),
+        h('button', { type: 'button', 'aria-label': L.regenerate }, L.regenerate),
+        h('button', { type: 'button', 'aria-label': L.share }, L.share),
       ),
     );
   }
 
   function showTurnError(turn, text) {
     turn.group.append(
-      h('div', { class: 'text-token-text-error', role: 'alert' }, h('span', {}, text), ' ', h('button', { type: 'button', 'data-testid': 'regenerate-thread-error-button' }, 'Retry')),
+      h('div', { class: 'text-token-text-error', role: 'alert' }, h('span', {}, text), ' ', h('button', { type: 'button', 'data-testid': tid('regenerate-thread-error-button') }, L.retry)),
     );
   }
 
@@ -682,6 +815,12 @@
 
   // ------------------------------------------------------------------- send
 
+  function serializeForSend(text) {
+    if (CONFIG.sendTransform === 'escape-markdown') return text.replace(/([\\*_])/g, '\\$1');
+    if (CONFIG.sendTransform === 'truncate-half') return text.slice(0, Math.ceil(text.length / 2));
+    return text;
+  }
+
   async function sentinel() {
     const prep = await api('POST', '/backend-api/sentinel/chat-requirements/prepare', { p: 'gAAAAAC-fake-requirements' });
     const fin = await api('POST', '/backend-api/sentinel/chat-requirements/finalize', { prepare_token: prep.prepare_token });
@@ -697,8 +836,11 @@
 
   async function submit() {
     if (state.generating) return;
+    // A blocking banner (rate limit, usage cap) keeps the UI from sending at all.
+    if (CONFIG.uiBanner) return;
     const prompt = serialize();
     if (prompt.trim() === '' && state.chips.length === 0) return;
+    if (!state.token) return guestSubmit(prompt);
     const attachments = state.chips.map((c) => ({ id: c.id, name: 'Pasted text.txt', mime_type: 'text/plain', size: c.text.length }));
     state.chips.forEach((c) => c.el.remove());
     state.chips = [];
@@ -720,7 +862,7 @@
             id: userMsgId,
             author: { role: 'user' },
             create_time: Date.now() / 1000,
-            content: { content_type: 'text', parts: [prompt] },
+            content: { content_type: 'text', parts: [serializeForSend(prompt)] },
             metadata: { serialization_metadata: { custom_symbol_offsets: [] }, ...(attachments.length ? { attachments } : {}) },
           },
         ],
@@ -763,7 +905,7 @@
         }
         const msg =
           (detail && (detail.message || (typeof detail === 'string' ? detail : null))) ||
-          (res.status === 429 ? 'Too many requests. Please try again later.' : 'Something went wrong. If this issue persists please contact us through our help center at help.openai.com.');
+          (res.status === 429 ? L.tooMany : L.wentWrong);
         showTurnError(turn, msg);
         return;
       }
@@ -787,9 +929,9 @@
       }
       if (stream.handoff && !stream.complete && !gen.stopped) await followTopic(stream, stream.handoff, gen);
       if (stream.error) showTurnError(turn, stream.error);
-      else if (!stream.complete && !gen.stopped) showTurnError(turn, 'Network error. The response was interrupted.');
+      else if (!stream.complete && !gen.stopped) showTurnError(turn, L.interrupted);
     } catch (e) {
-      if (!(e && e.name === 'AbortError')) showTurnError(turn, 'Something went wrong. Network connection lost.');
+      if (!(e && e.name === 'AbortError')) showTurnError(turn, e && e.status === 429 ? L.tooMany : L.networkLost);
     } finally {
       if (stream) {
         if (stream.answerId) {
@@ -801,14 +943,27 @@
       }
       state.generating = null;
       updateSubmit();
-      if (stream && stream.complete) announcer.textContent = 'Response complete';
+      if (stream && stream.complete) announcer.textContent = L.responseComplete;
       refreshHistory();
+    }
+  }
+
+  /** Logged-out guest send: another endpoint, no access token (the extension must never get here). */
+  async function guestSubmit(prompt) {
+    state.anonSends++;
+    clearComposer();
+    newTurn(prompt, crypto.randomUUID());
+    try {
+      await fetch('/backend-anon/f/conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ messages: [{ content: { parts: [prompt] } }] }) });
+    } catch {
+      /* ignore */
     }
   }
 
   function stop() {
     const g = state.generating;
     if (!g) return;
+    state.stops++;
     g.stopped = true;
     g.ctrl.abort();
     if (g.wsCancel) g.wsCancel();
@@ -816,16 +971,15 @@
 
   // ---------------------------------------------------------------- layout
 
+  function loginButtons() {
+    // The localized logged-out header has plain buttons: no /auth/login link, no test id.
+    return TESTIDS
+      ? [h('a', { href: '/auth/login', 'data-testid': 'login-button' }, L.login), h('button', { type: 'button', 'data-testid': 'signup-button' }, L.signup)]
+      : [h('button', { type: 'button' }, L.login), h('button', { type: 'button' }, L.signup)];
+  }
+
   function renderLoggedOut() {
-    root.replaceChildren(
-      h(
-        'div',
-        { class: 'login' },
-        h('h1', {}, 'Get smarter responses, upload files and images, and more.'),
-        h('a', { href: '/auth/login', 'data-testid': 'login-button' }, 'Log in'),
-        h('button', { type: 'button', 'data-testid': 'signup-button' }, 'Sign up for free'),
-      ),
-    );
+    root.replaceChildren(h('div', { class: 'login' }, h('h1', {}, L.loginTitle), ...loginButtons()));
   }
 
   async function refreshHistory() {
@@ -841,6 +995,7 @@
   function renderApp() {
     thread = h('div', { id: 'thread' });
     announcer = h('span', { class: 'sr-only m-0', role: 'status', 'aria-live': 'polite' });
+    const banner = CONFIG.uiBanner ? h('div', { role: 'alert', class: 'text-token-text-error' }, CONFIG.uiBanner) : null;
     editor = h('div', {
       contenteditable: 'true',
       'aria-multiline': 'true',
@@ -850,16 +1005,16 @@
       translate: 'no',
       class: 'ProseMirror',
       'data-composer-markdown': '',
-      'aria-label': 'Ask ChatGPT',
+      'aria-label': L.placeholder,
       'data-virtualkeyboard': 'true',
     });
     attachmentsEl = h('div', { class: 'attachments' });
     submitSlot = h('span', { class: 'submit-slot' });
     modeGroup = h(
       'div',
-      { role: 'group', 'aria-label': 'Composer mode' },
-      h('button', { type: 'button', onclick: () => setMode('chat') }, 'Chat'),
-      h('button', { type: 'button', onclick: () => setMode('work') }, 'Work'),
+      { role: 'group', 'aria-label': L.modeGroup },
+      h('button', { type: 'button', onclick: () => setMode('chat') }, L.chat),
+      h('button', { type: 'button', onclick: () => setMode('work') }, L.work),
     );
     const form = h(
       'form',
@@ -869,10 +1024,10 @@
       h(
         'div',
         { class: 'toolbar' },
-        modeGroup,
-        h('button', { type: 'button', 'aria-label': 'Select ChatGPT model', 'data-codex-intelligence-trigger': 'true', 'data-selected-reasoning-effort': 'medium' }, 'Thinking'),
+        state.token ? modeGroup : null,
+        h('button', { type: 'button', 'aria-label': L.model, 'data-codex-intelligence-trigger': 'true', 'data-selected-reasoning-effort': 'medium' }, 'Thinking'),
         h('span', { class: 'spacer' }),
-        h('button', { type: 'button', 'aria-label': 'Start dictation' }, 'Dictate'),
+        h('button', { type: 'button', 'aria-label': L.dictate }, L.dictate),
         submitSlot,
       ),
     );
@@ -885,11 +1040,12 @@
       h(
         'div',
         { class: 'app' },
-        h('nav', { class: 'sidebar', 'aria-label': 'Chat history' }, h('a', { href: '/', 'data-testid': 'create-new-chat-button' }, 'New chat'), historyEl),
+        h('nav', { class: 'sidebar', 'aria-label': 'Chat history' }, h('a', { href: '/', 'data-testid': tid('create-new-chat-button') }, L.newChat), historyEl),
         h(
           'main',
           {},
-          h('header', { class: 'top' }, h('strong', {}, state.temporary ? 'Temporary Chat' : 'ChatGPT')),
+          h('header', { class: 'top' }, h('strong', {}, state.temporary ? 'Temporary Chat' : 'ChatGPT'), ...(state.token ? [] : loginButtons())),
+          banner,
           thread,
           h('div', { class: 'composer-area' }, form),
           h('h4', { class: 'sr-only m-0' }, 'Latest response'),
@@ -905,6 +1061,7 @@
     editor.addEventListener('paste', onPaste);
     editor.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' || e.isComposing) return;
+      if (CONFIG.trustedEnterOnly && !e.isTrusted) return;
       e.preventDefault();
       if (e.shiftKey) {
         const { start, end } = selectionPositions();
@@ -925,7 +1082,11 @@
     } catch {
       /* offline */
     }
-    if (!session.accessToken) return renderLoggedOut();
+    if (!session.accessToken) {
+      if (!CONFIG.guestComposer) return renderLoggedOut();
+      renderApp(); // guest mode: a working composer next to the login buttons
+      return;
+    }
     state.token = session.accessToken;
     // ?model= selects the model and is then dropped from the URL (temporary-chat stays).
     if (params.has('model')) {
@@ -946,7 +1107,7 @@
         state.currentNode = conv.current_node;
         renderStored(chain);
       } catch (e) {
-        toast(e.status === 404 ? 'Unable to load conversation. Conversation not found.' : 'Unable to load conversation.');
+        toast(e.status === 404 ? L.notFound : L.loadFailed);
       }
     }
     refreshHistory();
@@ -956,7 +1117,7 @@
     composerText: () => serialize(),
     composerParagraphs: () => paras.slice(),
     get state() {
-      return { ...state, generating: !!state.generating, chips: state.chips.length };
+      return { ...state, generating: !!state.generating, chips: state.chips.length, token: state.token ? '(set)' : null };
     },
   };
 
