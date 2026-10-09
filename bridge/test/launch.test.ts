@@ -17,8 +17,9 @@ describe('launcher', () => {
     assert.equal(env.PATH, '/bin');
   });
 
-  it('defaults to the "default" permission mode unless one is given', () => {
-    assert.deepEqual(claudeArgs(['-p', 'hi']), ['--permission-mode', 'default', '-p', 'hi']);
+  it('defaults to "default" (interactive) or "acceptEdits" (-p) unless a mode is given', () => {
+    assert.deepEqual(claudeArgs(['hi']), ['--permission-mode', 'default', 'hi']);
+    assert.deepEqual(claudeArgs(['-p', 'hi']), ['--permission-mode', 'acceptEdits', '-p', 'hi']);
     assert.deepEqual(claudeArgs(['--permission-mode', 'plan']), ['--permission-mode', 'plan']);
     assert.deepEqual(claudeArgs(['--permission-mode=acceptEdits']), ['--permission-mode=acceptEdits']);
     assert.deepEqual(claudeArgs(['--dangerously-skip-permissions']), ['--dangerously-skip-permissions']);
@@ -54,9 +55,28 @@ describe('model resolution', () => {
 describe('lite mode', () => {
   it('expands --lite into a small --tools list', async () => {
     const { claudeArgs, LITE_TOOLS } = await import('../src/launch.ts');
-    const a = claudeArgs(['--lite', '-p', 'x']);
-    assert.deepEqual(a.slice(0, 4), ['--permission-mode', 'default', '--tools', LITE_TOOLS.join(',')]);
-    assert.ok(!a.includes('--lite'));
+    const a = claudeArgs(['--lite', 'do it']);
+    // "--tools=" form, so the variadic option cannot swallow the prompt.
+    assert.deepEqual(a, ['--permission-mode', 'default', `--tools=${LITE_TOOLS.join(',')}`, 'do it']);
     assert.ok(!LITE_TOOLS.includes('Agent'));
+  });
+});
+
+describe('settings layer', () => {
+  it('merges the bridge env into a --settings the user passed', async () => {
+    const { claudeArgs } = await import('../src/launch.ts');
+    const a = claudeArgs(['--settings', '{"model":"x","env":{"FOO":"1","ANTHROPIC_BASE_URL":"http://elsewhere"}}', 'hi'], { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765' });
+    const merged = JSON.parse(a[a.indexOf('--settings') + 1]!);
+    assert.equal(merged.model, 'x');
+    assert.equal(merged.env.FOO, '1');
+    assert.equal(merged.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:8765');
+    assert.equal(merged.disableAutoMode, 'disable');
+    assert.equal(a.filter((x) => x.startsWith('--settings')).length, 1);
+  });
+
+  it('empties every cloud-provider switch', () => {
+    const env = claudeEnv(defaultConfig());
+    assert.equal(env.CLAUDE_CODE_USE_BEDROCK, '');
+    assert.equal(env.CLAUDE_CODE_USE_VERTEX, '');
   });
 });

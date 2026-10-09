@@ -24,6 +24,7 @@ import {
 } from './session/store.ts';
 import { parseReply, safeStreamPrefix } from './translate/parser.ts';
 import {
+  isTextOnlyRequest,
   estimateRequestTokens,
   estimateTokens,
   lastAssistantIndex,
@@ -75,8 +76,8 @@ export interface BridgeState {
   /** The agent-loop turn in flight per Claude Code session/agent (they are strictly sequential). */
   mainInflight: Map<string, Omit<Orphan, 'timer'> & { rHash: string }>;
   /** When ChatGPT reported a usage cap, fail fast until this time. */
-  rateLimitedUntil: number;
-  rateLimitMessage: string;
+  /** ChatGPT usage caps per model slug ('' = the tab's model): fail fast until they clear. */
+  rateLimits: Map<string, { until: number; message: string }>;
   stats: { requests: number; chatgptTurns: number; localReplies: number; errors: number; continued: number; replayed: number };
 }
 
@@ -92,8 +93,7 @@ export function createState(config: BridgeConfig, provider: ChatProvider, log: L
     orphans: new Map(),
     activeConversations: new Set(),
     mainInflight: new Map(),
-    rateLimitedUntil: 0,
-    rateLimitMessage: '',
+    rateLimits: new Map(),
     stats: { requests: 0, chatgptTurns: 0, localReplies: 0, errors: 0, continued: 0, replayed: 0 },
   };
 }
@@ -363,16 +363,14 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     sendBridgeError(res, new BridgeError('invalid_request_error', 'web search is disabled in the webGPT4CC bridge config', false));
     return;
   }
-  if (state.rateLimitedUntil > Date.now()) {
-    sendBridgeError(
-      res,
-      new BridgeError('rate_limit_error', `ChatGPT usage limit: ${state.rateLimitMessage}`, false, state.rateLimitedUntil - Date.now()),
-    );
-    return;
-  }
 
   // 2. Deduplicate client retries of an identical request.
   const chatModel = resolved.slug;
+  const limit = state.rateLimits.get(chatModel);
+  if (limit && limit.until > Date.now()) {
+    sendBridgeError(res, new BridgeError('rate_limit_error', `ChatGPT usage limit: ${limit.message}`, false, limit.until - Date.now()));
+    return;
+  }
   // Subagents share the session id; x-claude-code-agent-id tells them apart.
   const scope = header('x-claude-code-session-id') ? `${header('x-claude-code-session-id')}/${header('x-claude-code-agent-id') || 'main'}` : '';
   const rHash = requestHash(req, chatModel, scope);
@@ -500,7 +498,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
       result = await runJob(state, plan, abort.signal, onProgress);
     }
     state.stats.chatgptTurns++;
-    const textOnly = plan.tools.length === 0 || req.tool_choice?.type === 'none';
+    const textOnly = plan.tools.length === 0 || req.tool_choice?.type === 'none' || isTextOnlyRequest(req);
     const parsed = parseReply(result.text, plan.tools, { toolCalls: !textOnly });
     for (const w of parsed.warnings) log.warn(`parser: ${w}`);
     // A reply cut off by ChatGPT's output limit must not run a half-written tool call
@@ -562,8 +560,7 @@ export async function handleMessages(state: BridgeState, httpReq: IncomingMessag
     // The turn reached ChatGPT but its reply was never delivered: the next message must say so.
     if (plan.conversation.kind === 'continue' && submitted && (abort.signal.aborted || lastFull)) state.interrupted.add(plan.conversation.conversationId);
     if (err.type === 'rate_limit_error') {
-      state.rateLimitedUntil = Date.now() + (err.retryAfterMs ?? 60_000);
-      state.rateLimitMessage = err.message.replace(/^ChatGPT usage limit: /, '');
+      state.rateLimits.set(chatModel, { until: Date.now() + (err.retryAfterMs ?? 60_000), message: err.message.replace(/^ChatGPT usage limit: /, '') });
     }
     if (abort.signal.aborted) {
       log.info('turn cancelled');

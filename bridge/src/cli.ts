@@ -189,11 +189,9 @@ function runClaude(args: string[], flags: Record<string, string | boolean>): voi
   }
   if (shell) finalArgs = finalArgs.map(cmdQuote);
   const cleanup = () => tmp && rmSync(tmp, { recursive: true, force: true });
-  process.on('SIGTERM', () => {
-    cleanup();
-    process.exit(143);
-  });
   const child = spawn(shell ? cmdQuote(command) : command, finalArgs, { stdio: 'inherit', env, shell });
+  // Forward termination to claude (it would otherwise keep running and spending ChatGPT messages).
+  for (const sig of ['SIGTERM', 'SIGHUP'] as const) process.on(sig, () => child.kill(sig));
   // Ctrl+C reaches claude directly (same process group); don't let it kill the launcher first.
   process.on('SIGINT', () => {});
   child.on('exit', (code, signal) => {
@@ -242,6 +240,8 @@ export async function main(argv: string[]): Promise<void> {
         | 'cmd'
         | 'fish';
       console.log(formatEnv(claudeEnv(config, typeof flags.model === 'string' ? flags.model : undefined), shell));
+      // Plain `claude` starts in "auto" permission mode, whose safety classifier cannot run through ChatGPT.
+      console.log(`${shell === 'cmd' ? 'rem' : '#'} Then run: claude --permission-mode default   (or acceptEdits; never auto)`);
       return;
     }
     case 'version':

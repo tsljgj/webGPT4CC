@@ -291,9 +291,14 @@ export function lastAssistantIndex(messages: MessageParam[]): number {
   return -1;
 }
 
-function isTextOnlyRequest(req: MessagesRequest): boolean {
-  const last = req.messages[req.messages.length - 1];
-  return !!last && last.role === 'user' && /CRITICAL: Respond with TEXT ONLY\. Do NOT call any tools/.test(textOf(last.content));
+/** Claude Code's compaction prompt (it may be followed by role:"system" messages). */
+export function isTextOnlyRequest(req: MessagesRequest): boolean {
+  for (let i = req.messages.length - 1; i >= 0; i--) {
+    const m = req.messages[i]!;
+    if (m.role === 'assistant') return false;
+    if (m.role === 'user') return /CRITICAL: Respond with TEXT ONLY\. Do NOT call any tools/.test(textOf(m.content));
+  }
+  return false;
 }
 
 function toolChoiceNote(req: MessagesRequest): string {

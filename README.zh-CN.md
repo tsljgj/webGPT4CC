@@ -80,16 +80,23 @@ webgpt4cc serve
 ```bash
 cd your-project
 gptcc                      # 交互模式
-gptcc -p "给 src/api.ts 加上输入校验，并跑一下测试"
+gptcc -p "给 src/api.ts 加上输入校验，并跑一下测试" --allowedTools "Bash(npm test:*)"
 ```
 
 `gptcc` 就是带上 bridge 环境变量的 `claude`，`claude` 的所有参数都能用。
-加上 `--lite` 后，Claude Code 只保留核心工具（Bash、Read、Edit、Write、WebFetch、WebSearch、
-NotebookEdit、AskUserQuestion，不启用子 agent）。第一条 ChatGPT 消息会从约 45 KB 缩小到约 20 KB，
-适合上下文窗口较小的套餐。它默认使用
-`default` 权限模式，因为 Claude Code 的 `auto` 模式每次调用工具都要额外发两个很大的模型请求
-（安全分类器），走 ChatGPT 不现实。如果想用别的客户端，执行 `eval "$(webgpt4cc env)"`
-（PowerShell 用 `webgpt4cc env --shell powershell`）之后再运行 `claude`。
+
+* **权限模式。** Claude Code 的 `auto` 模式每次调用工具都会让安全分类器额外发两个很大的模型请求，
+  走 ChatGPT 不现实。所以如果你没有自己指定，`gptcc` 在交互模式下使用 `default`（执行操作前会询问），
+  在 `-p` 无人值守模式下使用 `acceptEdits`。`acceptEdits` 模式允许编辑项目内的文件，
+  其他操作需要用 `--allowedTools` 规则放行（见上面的例子）。
+* **`--lite`** 让 Claude Code 只保留核心工具（Bash、Read、Edit、Write、WebFetch、WebSearch、
+  NotebookEdit、AskUserQuestion，不启用子 agent）。第一条 ChatGPT 消息会从约 45 KB 缩小到约 20 KB，
+  适合上下文窗口较小的套餐。
+* **其他客户端：** 执行 `eval "$(webgpt4cc env)"`（PowerShell 用 `webgpt4cc env --shell powershell`），
+  然后运行 `claude --permission-mode default`（不要用 `auto`）。
+* `gptcc`、`webgpt4cc env`、`pair`、`doctor` 和插件都通过 `~/.webgpt4cc/config.json` 找到 bridge。
+  如果 bridge 用了别的端口，请在配置文件里设置 `port`（或者对所有命令设置 `WEBGPT4CC_PORT`），
+  不要只用 `serve --port`。
 
 **在普通 Claude Code 里委派任务（插件）：**
 
@@ -116,7 +123,7 @@ NotebookEdit、AskUserQuestion，不启用子 agent）。第一条 ChatGPT 消�
 | `extensionToken` | 随机 | 扩展连接时必须携带的 token |
 | `models.default` | `""` | 主循环用的 ChatGPT 模型 slug。留空表示使用 worker 标签页里当前选中的模型（最可靠） |
 | `models.background` | `""` | Claude Code 小型辅助请求用的模型 |
-| `models.map` | `{}` | 把请求的模型名映射到 slug，例如 `{"opus": "gpt-5-6-thinking"}` |
+| `models.map` | `{}` | 把模型名映射到 ChatGPT slug，例如 `{"gpt-fast": "gpt-5-5-instant"}`，然后用 `gptcc --model gpt-fast`（或 `/model gpt-fast`）。以 `gpt-`、`o3` 等开头的名字会直接作为 slug 使用 |
 | `newChatUrl` | `https://chatgpt.com/?model={model}` | 新对话的 URL。可以填某个 ChatGPT 项目（Project）的地址，把 bridge 的对话集中放在一起 |
 | `temporaryChats` | `false` | 新对话用“临时聊天”（不进历史记录，不用记忆） |
 | `conversationMode` | `continue` | 设为 `stateless` 时，每个请求都开一个新对话 |

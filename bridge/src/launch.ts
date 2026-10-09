@@ -1,4 +1,5 @@
 // Environment for running the `claude` CLI against the bridge.
+import { readFileSync } from 'node:fs';
 import { type BridgeConfig, DEFAULT_CLAUDE_MODEL_NAME } from './config.ts';
 
 /** Variables that would make a child `claude` talk to Anthropic (or think it is nested) instead of the bridge. */
@@ -32,6 +33,17 @@ export function bridgeUrl(config: Pick<BridgeConfig, 'host' | 'port'>): string {
   const host = config.host === '0.0.0.0' || config.host === '::' ? '127.0.0.1' : config.host;
   return `http://${host.includes(':') ? `[${host}]` : host}:${config.port}`;
 }
+
+/** Variables that route Claude Code to a cloud provider instead of ANTHROPIC_BASE_URL. */
+export const PROVIDER_SWITCHES = [
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+  'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+  'CLAUDE_CODE_USE_MANTLE',
+  'CLAUDE_CODE_USE_GATEWAY',
+];
 
 /** Env overrides that point Claude Code at the bridge. */
 export function claudeEnv(config: BridgeConfig, model?: string): Record<string, string> {
@@ -74,6 +86,9 @@ export function claudeEnv(config: BridgeConfig, model?: string): Record<string, 
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     // Lets the bridge recognise main/subagent/compaction/auxiliary requests.
     CLAUDE_CODE_GATEWAY_HINT_HEADERS: '1',
+    // A cloud provider enabled in the user's settings would bypass ANTHROPIC_BASE_URL.
+    // Empty (not "0": the CLI tests some of these for plain truthiness).
+    ...Object.fromEntries(PROVIDER_SWITCHES.map((k) => [k, ''])),
     DISABLE_PROMPT_CACHING: '1',
   };
   return env;
@@ -104,9 +119,33 @@ function hasFlag(args: string[], flags: string[]): boolean {
  */
 export function claudeArgs(args: string[], env?: Record<string, string>): string[] {
   args = expandLite(args);
-  const out = hasFlag(args, PERMISSION_FLAGS) ? [...args] : ['--permission-mode', 'default', ...args];
-  if (env && !hasFlag(args, ['--settings'])) out.unshift('--settings', claudeSettings(env));
+  // Headless runs (-p) cannot answer permission prompts: "default" would deny every edit there.
+  const headless = args.some((a) => a === '-p' || a === '--print');
+  let out = hasFlag(args, PERMISSION_FLAGS) ? [...args] : ['--permission-mode', headless ? 'acceptEdits' : 'default', ...args];
+  if (env) {
+    // Merge the bridge layer into a --settings the user passed (Claude Code takes only one).
+    const i = out.findIndex((a) => a === '--settings' || a.startsWith('--settings='));
+    if (i < 0) out.unshift('--settings', claudeSettings(env));
+    else {
+      const inline = out[i]!.startsWith('--settings=');
+      const value = inline ? out[i]!.slice('--settings='.length) : (out[i + 1] ?? '');
+      const merged = mergeSettings(value, env);
+      out = [...out.slice(0, i), '--settings', merged, ...out.slice(i + (inline ? 1 : 2))];
+    }
+  }
   return out;
+}
+
+/** User settings (JSON text or a file path) + the bridge env layer, as JSON text. */
+export function mergeSettings(userValue: string, env: Record<string, string>): string {
+  let user: Record<string, unknown> = {};
+  try {
+    user = JSON.parse(userValue.trim().startsWith('{') ? userValue : readFileSync(userValue, 'utf8')) as Record<string, unknown>;
+  } catch {
+    throw new Error(`could not read --settings ${userValue}`);
+  }
+  const userEnv = (user.env && typeof user.env === 'object' ? user.env : {}) as Record<string, string>;
+  return JSON.stringify({ ...user, env: { ...userEnv, ...env }, disableAutoMode: 'disable' });
 }
 
 /**
@@ -120,7 +159,8 @@ export function expandLite(args: string[]): string[] {
   const i = args.indexOf('--lite');
   if (i < 0) return args;
   const rest = [...args.slice(0, i), ...args.slice(i + 1)];
-  return hasFlag(rest, ['--tools']) ? rest : ['--tools', LITE_TOOLS.join(','), ...rest];
+  // "--tools=a,b" form: the variadic "--tools a,b" would swallow a following prompt argument.
+  return hasFlag(rest, ['--tools']) ? rest : [`--tools=${LITE_TOOLS.join(',')}`, ...rest];
 }
 
 /** `--bare` mode only reads ANTHROPIC_API_KEY (sent as x-api-key, which the bridge accepts). */

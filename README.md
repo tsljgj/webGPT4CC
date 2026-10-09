@@ -88,16 +88,25 @@ On first run this creates `~/.webgpt4cc/config.json` with two random tokens.
 ```bash
 cd your-project
 gptcc                      # interactive
-gptcc -p "add input validation to src/api.ts and run the tests"
+gptcc -p "add input validation to src/api.ts and run the tests" --allowedTools "Bash(npm test:*)"
 ```
 
 `gptcc` is `claude` with the bridge environment. Any `claude` flags work.
-Add `--lite` to give Claude Code only the core tools (Bash, Read, Edit, Write, WebFetch,
-WebSearch, NotebookEdit, AskUserQuestion; no subagents). The first ChatGPT message then
-shrinks from about 45 KB to about 20 KB, which helps on plans with small context windows.
-It starts in the `default` permission mode, because Claude Code's `auto` mode makes
-two very large extra model calls per tool use. To use another client, run
-`eval "$(webgpt4cc env)"` (or `webgpt4cc env --shell powershell`) and then `claude`.
+
+* **Permission mode.** Claude Code's `auto` mode runs a safety classifier that makes two very
+  large extra model calls per tool use, which can't work through ChatGPT. So unless you pass
+  a mode yourself, `gptcc` starts in `default` mode (it asks before acting) when interactive,
+  and in `acceptEdits` mode with `-p`, where nobody can answer a prompt. In `acceptEdits` mode
+  file edits inside the project are allowed and anything else needs an `--allowedTools` rule,
+  as in the example above.
+* **`--lite`** gives Claude Code only the core tools (Bash, Read, Edit, Write, WebFetch, WebSearch,
+  NotebookEdit, AskUserQuestion; no subagents). The first ChatGPT message then shrinks from
+  about 45 KB to about 20 KB, which helps on plans with small context windows.
+* **Other clients:** run `eval "$(webgpt4cc env)"` (or `webgpt4cc env --shell powershell`), then
+  `claude --permission-mode default` (never `auto`).
+* `gptcc`, `webgpt4cc env`, `pair`, `doctor` and the plugin find the bridge through
+  `~/.webgpt4cc/config.json`. If you run the bridge on another port, set `port` there (or
+  `WEBGPT4CC_PORT` for every command), not only `serve --port`.
 
 **Delegate from your normal Claude Code (plugin):**
 
@@ -125,7 +134,7 @@ faster delegate. A delegate cannot delegate again.
 | `extensionToken` | random | Token the extension must present |
 | `models.default` | `""` | ChatGPT model slug for the agent loop. Empty means use the model selected in the worker tab (most reliable) |
 | `models.background` | `""` | Slug for Claude Code's small helper requests |
-| `models.map` | `{}` | Map a requested model name to a slug, e.g. `{"opus": "gpt-5-6-thinking"}` |
+| `models.map` | `{}` | Map a model name to a ChatGPT slug, e.g. `{"gpt-fast": "gpt-5-5-instant"}`, then `gptcc --model gpt-fast` (or `/model gpt-fast`). Names starting with `gpt-` or `o3`… are passed through as slugs |
 | `newChatUrl` | `https://chatgpt.com/?model={model}` | URL for new chats. Use a project URL to keep bridge chats in one ChatGPT project |
 | `temporaryChats` | `false` | Open new chats as temporary chats (not saved to history, no memory) |
 | `conversationMode` | `continue` | `stateless` starts a new chat for every request |

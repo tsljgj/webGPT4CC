@@ -19,11 +19,13 @@
    - `probe` (`max_tokens: 1`) → answered locally;
    - `classifier` (auto-mode safety monitor) → refused (`invalid_request_error`, no retry), so Claude Code blocks the action instead of anything approving it;
    - `web_search` (server tool `web_search_*`) → a one-off ChatGPT chat that may browse;
-   - `background` (no client tools: WebFetch summaries, helpers) → a one-off temporary chat;
+   - `background` (no client tools: helpers) → a one-off temporary chat. WebFetch page digests are
+     answered locally with the page itself (`webFetchSummaries: local`), saving a message per fetch;
    - `main` → the agent loop.
 3. **Deduplicate**: an identical request (same Claude Code session id + canonical
    transcript) attaches to the in-flight or recently finished turn. This absorbs
-   Claude Code's retries, its non-streaming fallback, and stream-watchdog aborts
+   Claude Code's retries and stream-watchdog aborts (the launcher also disables the
+   non-streaming fallback, which would re-send the same turn with `stream: false`)
    (an abandoned turn keeps running for `orphanGraceMs` so a retry can adopt it).
 4. **Plan** (`handler.ts` + `session/store.ts`): if the last assistant message of
    the transcript is a reply the bridge produced and it is still the newest turn

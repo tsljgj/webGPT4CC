@@ -1,7 +1,7 @@
 // Classification of Claude Code requests and local answers for trivial helper calls.
 import type { MessagesRequest, StopReason, TextBlock } from './anthropic/types.ts';
 import type { BridgeConfig } from './config.ts';
-import { systemText, textOf } from './translate/render.ts';
+import { isTextOnlyRequest, systemText, textOf } from './translate/render.ts';
 
 /**
  * - main:       an agent-loop request (has client tools) -> continued ChatGPT conversation
@@ -20,8 +20,7 @@ export function isSafetyClassifierRequest(req: MessagesRequest): boolean {
 
 /** Claude Code's conversation-compaction request: same tools, but the model must answer in text. */
 export function isCompactionRequest(req: MessagesRequest): boolean {
-  const last = req.messages[req.messages.length - 1];
-  return !!last && last.role === 'user' && /CRITICAL: Respond with TEXT ONLY\. Do NOT call any tools/.test(textOf(last.content));
+  return isTextOnlyRequest(req);
 }
 
 export function isWebSearchRequest(req: MessagesRequest): boolean {

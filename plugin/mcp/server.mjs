@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
+import { request as httpRequest } from 'node:http';
 import { createInterface } from 'node:readline';
 
 const SERVER_INFO = { name: 'webgpt4cc', version: '0.1.0' };
@@ -36,7 +37,7 @@ export function loadBridgeSettings(env = process.env) {
     model: env.WEBGPT4CC_MODEL || file.models?.default || 'chatgpt-web',
     smallModel: file.models?.background || env.WEBGPT4CC_MODEL || file.models?.default || 'chatgpt-web',
     claudeBin: env.WEBGPT4CC_CLAUDE_BIN || 'claude',
-    contextWindow: String(file.claudeContextWindow ?? 128000),
+    contextWindow: String(file.claudeContextWindow ?? 120000),
   };
 }
 
@@ -62,6 +63,9 @@ const STRIPPED_ENV = [
   'CLAUDE_CODE_SESSION_ID',
   'CLAUDE_CODE_CHILD_SESSION',
   'CLAUDE_CODE_SSE_PORT',
+  'CLAUDE_CODE_REMOTE',
+  'CLAUDE_CODE_REMOTE_SESSION_ID',
+  'CLAUDE_CODE_REMOTE_SDK_URL',
   'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
   'CLAUDE_CODE_GZIP_REQUEST_BODIES',
 ];
@@ -73,6 +77,16 @@ function realOrSelf(p) {
     return p;
   }
 }
+
+const PROVIDER_SWITCHES = [
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+  'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+  'CLAUDE_CODE_USE_MANTLE',
+  'CLAUDE_CODE_USE_GATEWAY',
+];
 
 /** Env that points a child `claude` at the bridge (kept in sync with bridge/src/launch.ts). */
 export function bridgeEnv(settings, model) {
@@ -92,7 +106,7 @@ export function bridgeEnv(settings, model) {
     CLAUDE_STREAM_IDLE_TIMEOUT_MS: '1800000',
     CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: '3600000',
     CLAUDE_CODE_MAX_RETRIES: '3',
-    CLAUDE_CODE_MAX_CONTEXT_TOKENS: settings.contextWindow ?? '128000',
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: settings.contextWindow ?? '120000',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     CLAUDE_CODE_DISABLE_TERMINAL_TITLE: '1',
@@ -103,6 +117,9 @@ export function bridgeEnv(settings, model) {
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     CLAUDE_CODE_GATEWAY_HINT_HEADERS: '1',
     CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1',
+    // A cloud provider enabled in the user's settings would bypass ANTHROPIC_BASE_URL
+    // (empty, not "0": the CLI tests some of these for plain truthiness).
+    ...Object.fromEntries(PROVIDER_SWITCHES.map((k) => [k, ''])),
     DISABLE_PROMPT_CACHING: '1',
     // Marks the child as a delegate so this plugin, loaded again inside it, refuses to recurse.
     WEBGPT4CC_WORKER: '1',
@@ -234,19 +251,46 @@ async function askTool(args, settings, signal) {
   const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
   if (settings.token) headers.authorization = `Bearer ${settings.token}`;
   try {
-    const res = await fetch(`${settings.url}/v1/messages`, {
-      method: 'POST',
+    const res = await postJson(
+      `${settings.url}/v1/messages`,
+      { model: args.model || settings.model, max_tokens: 8192, messages: [{ role: 'user', content: question }] },
       headers,
-      body: JSON.stringify({ model: args.model || settings.model, max_tokens: 8192, messages: [{ role: 'user', content: question }] }),
       signal,
-    });
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok) return textResult(`Bridge error ${res.status}: ${json?.error?.message ?? 'unknown error'}`, true);
+    );
+    const json = res.json ?? {};
+    if (res.status !== 200) return textResult(`Bridge error ${res.status}: ${json?.error?.message ?? 'unknown error'}`, true);
     const text = (json.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
     return textResult(text || '(empty reply)');
   } catch (e) {
     return textResult(`Could not reach the webGPT4CC bridge at ${settings.url}: ${e.message}`, true);
   }
+}
+
+/**
+ * POST JSON with node:http: unlike fetch, it has no headers/body timeout, and a ChatGPT
+ * reply can take many minutes (the bridge answers once the reply is complete).
+ */
+function postJson(url, body, headers, signal) {
+  return new Promise((resolvePost, reject) => {
+    const payload = JSON.stringify(body);
+    const req = httpRequest(url, { method: 'POST', headers: { ...headers, 'content-length': Buffer.byteLength(payload) }, signal }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => (text += d));
+      res.on('end', () => {
+        let json;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          json = undefined;
+        }
+        resolvePost({ status: res.statusCode ?? 0, json });
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.end(payload);
+  });
 }
 
 function fmtDuration(ms) {
