@@ -8,6 +8,8 @@
 // (tool results, user text). Anything we can't match starts a new ChatGPT
 // conversation that replays the transcript.
 import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { ContentBlock, MessageParam, MessagesRequest, ResponseBlock, TextBlock, ToolUseBlock } from '../anthropic/types.ts';
 import { systemText } from '../translate/render.ts';
 
@@ -111,13 +113,19 @@ export class SessionStore {
   private readonly head = new Map<string, number>();
   private seq = 0;
   private readonly maxEntries: number;
+  /** JSON file the store is persisted to (so a bridge restart can keep continuing chats); '' = memory only. */
+  private readonly file: string;
+  private saveTimer: NodeJS.Timeout | undefined;
 
-  constructor(maxEntries = 5000) {
+  constructor(maxEntries = 5000, file = '') {
     this.maxEntries = maxEntries;
+    this.file = file;
+    if (file) this.load();
   }
 
   record(fingerprint: string, turn: TurnRecord): void {
     const seq = ++this.seq;
+    this.turns.delete(fingerprint);
     this.turns.set(fingerprint, { ...turn, seq, at: Date.now() });
     this.head.set(turn.conversationId, seq);
     if (this.turns.size > this.maxEntries) {
@@ -128,6 +136,52 @@ export class SessionStore {
         if (i++ >= drop) break;
         this.turns.delete(k);
       }
+      const live = new Set([...this.turns.values()].map((t) => t.conversationId));
+      for (const c of this.head.keys()) if (!live.has(c)) this.head.delete(c);
+    }
+    this.scheduleSave();
+  }
+
+  private load(): void {
+    try {
+      const data = JSON.parse(readFileSync(this.file, 'utf8')) as {
+        version: number;
+        seq: number;
+        turns: Array<[string, StoredTurn]>;
+        head: Array<[string, number]>;
+      };
+      if (data.version !== 1) return;
+      for (const [k, v] of data.turns) this.turns.set(k, v);
+      for (const [k, v] of data.head) this.head.set(k, v);
+      this.seq = data.seq;
+    } catch {
+      /* missing or corrupt: start empty */
+    }
+  }
+
+  private scheduleSave(): void {
+    if (!this.file || this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      this.flush();
+    }, 1000);
+    this.saveTimer.unref?.();
+  }
+
+  /** Write the store to disk now (called on shutdown). */
+  flush(): void {
+    if (!this.file) return;
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    try {
+      mkdirSync(dirname(this.file), { recursive: true });
+      const tmp = `${this.file}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ version: 1, seq: this.seq, turns: [...this.turns], head: [...this.head] }), { mode: 0o600 });
+      renameSync(tmp, this.file);
+    } catch {
+      /* best effort */
     }
   }
 
@@ -147,6 +201,7 @@ export class SessionStore {
   /** Forget a conversation (e.g. the worker reported it is gone). */
   dropConversation(conversationId: string): void {
     this.head.delete(conversationId);
+    this.scheduleSave();
   }
 
   get size(): number {

@@ -62,7 +62,7 @@ export function createState(config: BridgeConfig, provider: ChatProvider, log: L
   return {
     config,
     provider,
-    sessions: new SessionStore(),
+    sessions: new SessionStore(5000, config.sessionFile),
     cache: new ResponseCache<Completed>(),
     log,
     interrupted: new Set(),

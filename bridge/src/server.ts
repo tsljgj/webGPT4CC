@@ -196,6 +196,7 @@ export function createBridgeServer(config: BridgeConfig, log: Logger, provider: 
         });
       }),
     close: async () => {
+      state.sessions.flush();
       await provider.close?.();
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       server.closeAllConnections?.();

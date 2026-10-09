@@ -397,3 +397,36 @@ describe('Claude Code side requests', () => {
     }
   });
 });
+
+describe('session persistence', () => {
+  it('continues a ChatGPT conversation after a bridge restart', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const sessionFile = join(mkdtempSync(join(tmpdir(), 'wg-sess-')), 'sessions.json');
+    const replies = ['<tool_call name="Bash">\n<param name="command">pwd</param>\n</tool_call>', 'done'];
+    const mk = async () => {
+      const config: BridgeConfig = { ...defaultConfig(), port: 0, authToken: TOKEN, provider: 'mock', sessionFile };
+      const mock = new MockProvider({ script: () => replies.shift()!, chunkSize: 0 });
+      const bridge = createBridgeServer(config, silentLogger, mock);
+      await bridge.listen();
+      return { bridge, mock };
+    };
+    const a = await mk();
+    const first = { model: 'm', max_tokens: 100, stream: true, tools: TOOLS, messages: [{ role: 'user', content: 'where am i' }] };
+    const r1 = assemble(parseSse(await (await post(a.bridge.url(), '/v1/messages', first)).text()));
+    await a.bridge.close();
+    // The mock provider of the second bridge must know the conversation to continue it.
+    const b = await mk();
+    (b.mock as unknown as { conversations: Map<string, unknown[]> }).conversations = (a.mock as unknown as { conversations: Map<string, unknown[]> }).conversations;
+    const tu = r1.content.find((x) => x.type === 'tool_use')!;
+    await (
+      await post(b.bridge.url(), '/v1/messages', {
+        ...first,
+        messages: [...first.messages, { role: 'assistant', content: r1.content }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: tu.id, content: '/home' }] }],
+      })
+    ).text();
+    assert.equal(b.mock.jobs[0]!.conversation.kind, 'continue');
+    await b.bridge.close();
+  });
+});

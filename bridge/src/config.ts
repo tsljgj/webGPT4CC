@@ -58,6 +58,8 @@ export interface BridgeConfig {
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   /** If set, every prompt and reply is written to this directory (for debugging). */
   dumpDir: string;
+  /** Where the session map is persisted ('' = memory only). Defaults to ~/.webgpt4cc/sessions.json when a config file is used. */
+  sessionFile: string;
 }
 
 export const DEFAULT_PORT = 8765;
@@ -89,6 +91,7 @@ export function defaultConfig(): BridgeConfig {
     render: { ...DEFAULT_RENDER_OPTIONS },
     logLevel: 'info',
     dumpDir: '',
+    sessionFile: '',
   };
 }
 
@@ -162,7 +165,10 @@ function envOverrides(env: NodeJS.ProcessEnv): Partial<BridgeConfig> {
 
 export function loadConfig(opts: { file?: boolean; overrides?: Partial<BridgeConfig>; env?: NodeJS.ProcessEnv } = {}): BridgeConfig {
   let cfg = defaultConfig();
-  if (opts.file !== false) cfg = deepMerge(cfg, ensureConfigFile());
+  if (opts.file !== false) {
+    cfg.sessionFile = join(configDir(), 'sessions.json');
+    cfg = deepMerge(cfg, ensureConfigFile());
+  }
   cfg = deepMerge(cfg, envOverrides(opts.env ?? process.env));
   if (opts.overrides) cfg = deepMerge(cfg, opts.overrides);
   validateConfig(cfg);
