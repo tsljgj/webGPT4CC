@@ -204,3 +204,25 @@ describe('extension provider', () => {
     assert.equal(err.code, 'ui_error');
   });
 });
+
+describe('extension provider readiness', () => {
+  it('fails instead of waiting forever when connected tabs are never ready', async () => {
+    const config: BridgeConfig = { ...defaultConfig(), port: 0, extensionToken: EXT_TOKEN };
+    const provider = new ExtensionProvider({ extensionToken: EXT_TOKEN, allowedOrigins: [], newChatUrl: config.newChatUrl, workerWaitMs: 800, bridgeVersion: 't', log: silentLogger });
+    const bridge = createBridgeServer(config, silentLogger, provider);
+    await bridge.listen();
+    try {
+      const ext = new FakeExtension();
+      await ext.connect(bridge.url());
+      ext.workers([{ id: 'login', ready: false }]);
+      await wait(50);
+      const events = await collect(provider.run(job(), new AbortController().signal));
+      const err = events.at(-1) as { code: string; message: string };
+      assert.equal(err.code, 'no_worker');
+      assert.match(err.message, /none is ready/);
+      ext.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+});

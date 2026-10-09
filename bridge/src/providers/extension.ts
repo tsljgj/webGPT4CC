@@ -192,6 +192,12 @@ export class ExtensionProvider implements ChatProvider {
     return n;
   }
 
+  private readyWorkerCount(): number {
+    let n = 0;
+    for (const c of this.conns.values()) for (const w of c.workers.values()) if (w.ready) n++;
+    return n;
+  }
+
   /** Assign idle workers to waiting jobs (FIFO, honouring conversation affinity for a while). */
   private dispatch(): void {
     for (let i = 0; i < this.waiters.length; ) {
@@ -301,13 +307,20 @@ export class ExtensionProvider implements ChatProvider {
       };
       const onAbort = () => cleanup(() => (remove(), reject(new Error('aborted'))));
       signal.addEventListener('abort', onAbort, { once: true });
-      // Fail if no worker shows up at all within workerWaitMs.
+      // Fail if no usable worker shows up within workerWaitMs (busy workers are fine: we queue).
       const checkNoWorker = () => {
-        if (this.workerCount() === 0 && this.waiters.includes(waiter))
-          cleanup(() => {
-            remove();
-            reject(new Error(`no ChatGPT tab connected (waited ${Math.round(this.opts.workerWaitMs / 1000)}s)`));
-          });
+        if (this.readyWorkerCount() > 0 || !this.waiters.includes(waiter)) return;
+        const total = this.workerCount();
+        cleanup(() => {
+          remove();
+          reject(
+            new Error(
+              total === 0
+                ? `no ChatGPT tab connected (waited ${Math.round(this.opts.workerWaitMs / 1000)}s)`
+                : `${total} ChatGPT tab(s) connected but none is ready (logged out, still loading, or showing a dialog?) after ${Math.round(this.opts.workerWaitMs / 1000)}s`,
+            ),
+          );
+        });
       };
       noWorkerTimer = setTimeout(checkNoWorker, this.opts.workerWaitMs);
       // Re-run dispatch periodically so affinity waits can expire.
